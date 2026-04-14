@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# optcg runtime data — never commit these
+~/.config/optcg/
+*.db
+*.db-shm
+*.db-wal
+
+# Receipts and exports stay in iCloud, not in the repo
+receipts/
+exports/
