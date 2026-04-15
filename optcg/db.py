@@ -71,6 +71,20 @@ MIGRATIONS = [
         added_at     TEXT DEFAULT (datetime('now'))
     )
     """),
+    (5, """
+    ALTER TABLE items ADD COLUMN status TEXT NOT NULL DEFAULT 'owned'
+    """),
+    (6, """
+    ALTER TABLE items ADD COLUMN sell_price REAL;
+    ALTER TABLE items ADD COLUMN sell_date TEXT;
+    ALTER TABLE items ADD COLUMN sell_source TEXT
+    """),
+    (7, """
+    ALTER TABLE items ADD COLUMN cardmarket_url TEXT
+    """),
+    (8, """
+    ALTER TABLE items ADD COLUMN cardmarket_img TEXT
+    """),
 ]
 
 

@@ -92,6 +92,33 @@ Run `optcg config cookie-help` for detailed instructions.
 
 ---
 
+## Dashboard (offline HTML file)
+
+Generates a single self-contained `dashboard.html` with all your data baked in.
+No server. Open it by double-clicking on Mac or tapping in Files app on iPhone.
+
+```bash
+optcg dashboard            # generate + open immediately
+optcg dashboard --no-open  # just write the file to iCloud
+```
+
+The file is saved to **iCloud Drive → OnePieceTCG → exports/dashboard.html**
+and regenerated automatically every time you run `optcg price update --all`.
+
+On iPhone:
+1. Open **Files** → iCloud Drive → OnePieceTCG → exports.
+2. Tap `dashboard.html` — opens in Safari.
+
+Features:
+- **Overview** — invested / current value / P&L stat cards
+- **Portfolio over time** — value vs invested line chart
+- **Allocation** — donut by type or by set
+- **Items** — search + filter by type + sort
+- **Charts** — P&L per item bar chart
+- **Watchlist** — target prices
+
+---
+
 ## Phone features (iPhone / iPad)
 
 Your portfolio lives in **iCloud Drive → OnePieceTCG** and syncs automatically.
@@ -141,6 +168,7 @@ optcg receipt add / list / open
 optcg export csv
 optcg config show / set-cookie / clear-cookie / cookie-help
 optcg stats
+optcg dashboard [--out path] [--no-open]
 ```
 
 Run `optcg <command> -h` on any command for full options and examples.

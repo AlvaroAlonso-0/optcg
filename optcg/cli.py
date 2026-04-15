@@ -63,6 +63,7 @@ def _insert_item(
     graded: bool, grading_company: Optional[str], grade: Optional[str],
     cert_number: Optional[str], price: float, purchase_date: str,
     source: Optional[str], notes: Optional[str],
+    status: str = "owned",
 ) -> int:
     with db_conn() as conn:
         db = Database(conn)
@@ -70,12 +71,149 @@ def _insert_item(
             """INSERT INTO items
                (item_type, name, set_code, card_number, language, condition,
                 foil, variant, graded, grading_company, grade, cert_number,
-                purchase_price, purchase_date, purchase_source, notes)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                purchase_price, purchase_date, purchase_source, notes, status)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (item_type, name, set_code, card_number, language, condition,
              int(foil), variant, int(graded), grading_company, grade, cert_number,
-             price, purchase_date, source, notes),
+             price, purchase_date, source, notes, status),
         )
+
+
+def _auto_update(item_id: int) -> None:
+    """Fetch price for a single item and regenerate the dashboard. Called after add/edit."""
+    from optcg.scrapers.cardmarket import get_card_prices
+    from optcg.scrapers.ebay import search_sold_listings
+    from optcg.export import auto_export
+    try:
+        with db_conn() as conn:
+            db = Database(conn)
+            item = db.fetchone("SELECT * FROM items WHERE id = ?", (item_id,))
+            if not item:
+                return
+            saved = False
+            known_url = item["cardmarket_url"] if "cardmarket_url" in item.keys() else None
+            cm = get_card_prices(item["name"], item["set_code"], item["card_number"],
+                                 item["language"], item["item_type"], known_url=known_url)
+            for ptype in ("trend", "low", "market"):
+                if cm.get(ptype):
+                    db.execute(
+                        "INSERT INTO price_snapshots (item_id,source,price_type,price,url) VALUES (?,?,?,?,?)",
+                        (item["id"], "cardmarket", ptype, cm[ptype], cm.get("url")),
+                    )
+                    saved = True
+            if cm.get("url"):
+                db.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?",
+                           (cm["url"], item["id"]))
+            if cm.get("img"):
+                db.execute("UPDATE items SET cardmarket_img = ? WHERE id = ?",
+                           (cm["img"], item["id"]))
+            query = f"One Piece {item['card_number'] or ''} {item['name']}".strip()
+            sold  = search_sold_listings(query, max_results=5)
+            if sold:
+                avg = sum(l["price"] for l in sold) / len(sold)
+                db.execute(
+                    "INSERT INTO price_snapshots (item_id,source,price_type,price) VALUES (?,?,?,?)",
+                    (item["id"], "ebay", "sold_avg", avg),
+                )
+                saved = True
+            auto_export(db)
+        _SEALED = {"booster_box", "blister", "sealed_set"}
+        is_sealed = item["item_type"] in _SEALED
+        if saved:
+            parts = []
+            cm_p = cm.get("low") or cm.get("trend")
+            lbl  = "CM low" if cm.get("low") else "CM trend"
+            if cm_p:  parts.append(f"{lbl} {cm_p:.2f} €")
+            if sold:  parts.append(f"eBay {avg:.2f} €")
+            console.print(f"  [dim]Price: {'  ·  '.join(parts)}  · dashboard updated[/dim]")
+        else:
+            err = cm.get("error") or "no data found"
+            console.print(
+                f"  [dim yellow]Price fetch failed: {err}\n"
+                f"  → optcg price set {item_id} <price>[/dim yellow]"
+            )
+    except Exception as exc:
+        console.print(f"  [dim yellow]Price fetch error: {exc}[/dim yellow]")
+
+
+def _auto_update_multi(item_ids: list[int]) -> None:
+    """Fetch price once for item_ids[0], copy snapshot to all IDs, regen dashboard."""
+    from optcg.scrapers.cardmarket import get_card_prices
+    from optcg.scrapers.ebay import search_sold_listings
+    from optcg.export import auto_export
+    if not item_ids:
+        return
+    try:
+        with db_conn() as conn:
+            db = Database(conn)
+            item = db.fetchone("SELECT * FROM items WHERE id = ?", (item_ids[0],))
+            if not item:
+                return
+            saved = False
+            known_url = item["cardmarket_url"] if "cardmarket_url" in item.keys() else None
+            cm = get_card_prices(item["name"], item["set_code"], item["card_number"],
+                                 item["language"], item["item_type"], known_url=known_url)
+            for ptype in ("trend", "low", "market"):
+                if cm.get(ptype):
+                    for iid in item_ids:
+                        db.execute(
+                            "INSERT INTO price_snapshots (item_id, source, price_type, price, currency, url) "
+                            "VALUES (?, 'cardmarket', ?, ?, 'EUR', ?)",
+                            (iid, ptype, cm[ptype], cm.get("url")),
+                        )
+                    saved = True
+            if cm.get("url"):
+                for iid in item_ids:
+                    db.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?",
+                               (cm["url"], iid))
+            if cm.get("img"):
+                for iid in item_ids:
+                    db.execute("UPDATE items SET cardmarket_img = ? WHERE id = ?",
+                               (cm["img"], iid))
+
+            query = f"One Piece {item['card_number'] or ''} {item['name']}".strip()
+            sold_listings = search_sold_listings(query, max_results=5)
+            avg = None
+            if sold_listings:
+                avg = sum(x["price"] for x in sold_listings) / len(sold_listings)
+                for iid in item_ids:
+                    db.execute(
+                        "INSERT INTO price_snapshots (item_id, source, price_type, price, currency, url) "
+                        "VALUES (?, 'ebay_sold', 'sold_avg', ?, 'EUR', ?)",
+                        (iid, avg, sold_listings[0].get("url")),
+                    )
+                saved = True
+
+            auto_export(db)
+
+        _SEALED = {"booster_box", "blister", "sealed_set"}
+        is_sealed = item["item_type"] in _SEALED
+        if saved:
+            parts = []
+            cm_p = cm.get("low") or cm.get("trend")
+            lbl  = "CM low" if cm.get("low") else "CM trend"
+            if cm_p:  parts.append(f"{lbl} {cm_p:.2f} €")
+            if avg:   parts.append(f"eBay {avg:.2f} €")
+            console.print(f"  [dim]Price: {'  ·  '.join(parts)}  · dashboard updated[/dim]")
+        else:
+            err = cm.get("error") or "no data found"
+            console.print(
+                f"  [dim yellow]Price fetch failed: {err}\n"
+                f"  → optcg price set {item_ids[0]} <price>[/dim yellow]"
+            )
+    except Exception as exc:
+        console.print(f"  [dim yellow]Price fetch error: {exc}[/dim yellow]")
+
+
+def _regen_dashboard() -> None:
+    """Regenerate the HTML dashboard (no price fetch). Called after edit/remove."""
+    from optcg.export import auto_export
+    try:
+        with db_conn() as conn:
+            db = Database(conn)
+            auto_export(db)
+    except Exception:
+        pass
 
 
 # ── Root group ─────────────────────────────────────────────────────────────────
@@ -138,8 +276,10 @@ def add():
 @click.option("--date",      "-d", "purchase_date",  default=str(date.today()), show_default=True)
 @click.option("--source",          default=None,     help="CardMarket / eBay / LGS / ...")
 @click.option("--notes",           default=None)
+@click.option("--pending",         is_flag=True, default=False,
+              help="Pre-order / paid but not yet arrived")
 def add_card(name, set_code, card_number, lang, condition, foil, variant,
-             graded, grading_company, grade, cert, price, purchase_date, source, notes):
+             graded, grading_company, grade, cert, price, purchase_date, source, notes, pending):
     """Add a single card. Omit --name to search CardMarket interactively.
 
     \b
@@ -148,7 +288,7 @@ def add_card(name, set_code, card_number, lang, condition, foil, variant,
       optcg add card -n "Monkey D. Luffy" -s OP-01 -p 45.00
       optcg add card -n "Zoro" -s OP-01 -l JP -c NM -p 120.00 --foil
       optcg add card -n "Shanks" -p 200.00 --graded --gc PSA --grade 10 --cert 12345678
-      optcg add card -n "Luffy" -p 30.00 --variant "Alt Art" --source CardMarket
+      optcg add card -n "OP-10 Luffy" -p 45.00 --pending   # pre-order, not arrived yet
     """
     # ── Interactive card search ────────────────────────────────────────────────
     if not name:
@@ -175,15 +315,22 @@ def add_card(name, set_code, card_number, lang, condition, foil, variant,
         if not grade:
             grade = click.prompt("Grade (e.g. 10, 9.5)")
 
+    status = "pending" if pending else "owned"
     row_id = _insert_item("card", name, set_code, card_number, lang.upper(), condition,
                            foil, variant, graded, grading_company, grade, cert,
-                           price, purchase_date, source, notes)
-    console.print(f"[green]✓[/green] Added card [bold]#{row_id}[/bold]: {name}")
+                           price, purchase_date, source, notes, status)
+    flag = " [yellow][PENDING][/yellow]" if pending else ""
+    console.print(f"[green]✓[/green] Added card [bold]#{row_id}[/bold]: {name}{flag}")
+    with console.status("[dim]Fetching price…"):
+        _auto_update(row_id)
 
 
 @add.command("promo")
 @click.option("--name",      "-n", default=None,   help="Card name (omit to search interactively)")
 @click.option("--card-num",        "card_number",   default=None)
+@click.option("--set",       "-s", "set_code",     default=None,
+              help='Set code or promo category (e.g. P, PROMO-JP, P-OP)')
+@click.option("--variant",         default=None,   help="Variant label (e.g. V1, Alt Art)")
 @click.option("--lang",      "-l", default="EN",   type=_LANG_CHOICE,  show_default=True)
 @click.option("--condition", "-c", default="NM",   type=_COND_CHOICE,  show_default=True)
 @click.option("--graded",          is_flag=True,   default=False)
@@ -194,15 +341,17 @@ def add_card(name, set_code, card_number, lang, condition, foil, variant,
 @click.option("--date",      "-d", "purchase_date", default=str(date.today()))
 @click.option("--source",          default=None)
 @click.option("--notes",           default=None)
-def add_promo(name, card_number, lang, condition, graded, grading_company,
-              grade, cert, price, purchase_date, source, notes):
+@click.option("--pending",         is_flag=True, default=False,
+              help="Pre-order / paid but not yet arrived")
+def add_promo(name, card_number, set_code, variant, lang, condition, graded,
+              grading_company, grade, cert, price, purchase_date, source, notes, pending):
     """Add a promo card. Omit --name to search CardMarket interactively.
 
     \b
     Examples:
-      optcg add promo                            # search & pick interactively
+      optcg add promo                                           # search & pick interactively
       optcg add promo -n "Monkey D. Luffy" --card-num P-043 -p 8.00
-      optcg add promo -n "Nami" --card-num P-001 -l JP -p 25.00
+      optcg add promo -n "Monkey D. Luffy" --card-num ST21-014 --set P --variant V1 -l JP -c M -p 82.35
     """
     if not name:
         query = click.prompt("Search CardMarket")
@@ -219,10 +368,14 @@ def add_promo(name, card_number, lang, condition, graded, grading_company,
             grading_company = click.prompt("Grading company", type=_GRADE_CHOICE)
         if not grade:
             grade = click.prompt("Grade")
-    row_id = _insert_item("promo", name, None, card_number, lang.upper(), condition,
-                           False, None, graded, grading_company, grade, cert,
-                           price, purchase_date, source, notes)
-    console.print(f"[green]✓[/green] Added promo [bold]#{row_id}[/bold]: {name}")
+    status = "pending" if pending else "owned"
+    row_id = _insert_item("promo", name, set_code, card_number, lang.upper(), condition,
+                           False, variant, graded, grading_company, grade, cert,
+                           price, purchase_date, source, notes, status)
+    flag = " [yellow][PENDING][/yellow]" if pending else ""
+    console.print(f"[green]✓[/green] Added promo [bold]#{row_id}[/bold]: {name}{flag}")
+    with console.status("[dim]Fetching price…"):
+        _auto_update(row_id)
 
 
 @add.command("blister")
@@ -230,15 +383,26 @@ def add_promo(name, card_number, lang, condition, graded, grading_company,
 @click.option("--set",   "-s", "set_code",  default=None)
 @click.option("--lang",  "-l", default="EN", type=_LANG_CHOICE, show_default=True)
 @click.option("--price", "-p", required=True, type=float)
+@click.option("--qty",   "-q", default=1, type=click.IntRange(min=1), show_default=True,
+              help="Number of copies to add")
 @click.option("--date",  "-d", "purchase_date", default=str(date.today()))
 @click.option("--source",      default=None)
 @click.option("--notes",       default=None)
-def add_blister(name, set_code, lang, price, purchase_date, source, notes):
-    """Add a blister pack."""
-    row_id = _insert_item("blister", name, set_code, None, lang.upper(), "M",
-                           False, None, False, None, None, None,
-                           price, purchase_date, source, notes)
-    console.print(f"[green]✓[/green] Added blister [bold]#{row_id}[/bold]: {name}")
+@click.option("--pending",     is_flag=True, default=False, help="Pre-order / not yet arrived")
+def add_blister(name, set_code, lang, price, qty, purchase_date, source, notes, pending):
+    """Add a blister pack. Use --qty to add multiple copies at the same price."""
+    status = "pending" if pending else "owned"
+    ids = [
+        _insert_item("blister", name, set_code, None, lang.upper(), "M",
+                     False, None, False, None, None, None,
+                     price, purchase_date, source, notes, status)
+        for _ in range(qty)
+    ]
+    flag = " [yellow][PENDING][/yellow]" if pending else ""
+    id_s = f"#{ids[0]}" if qty == 1 else f"#{ids[0]}–#{ids[-1]}"
+    console.print(f"[green]✓[/green] Added {qty}× blister [bold]{id_s}[/bold]: {name}  {price:.2f} € each{flag}")
+    with console.status("[dim]Fetching price…"):
+        _auto_update_multi(ids)
 
 
 @add.command("box")
@@ -246,15 +410,26 @@ def add_blister(name, set_code, lang, price, purchase_date, source, notes):
 @click.option("--set",   "-s", "set_code",  default=None)
 @click.option("--lang",  "-l", default="EN", type=_LANG_CHOICE, show_default=True)
 @click.option("--price", "-p", required=True, type=float)
+@click.option("--qty",   "-q", default=1, type=click.IntRange(min=1), show_default=True,
+              help="Number of copies to add")
 @click.option("--date",  "-d", "purchase_date", default=str(date.today()))
 @click.option("--source",      default=None)
 @click.option("--notes",       default=None)
-def add_box(name, set_code, lang, price, purchase_date, source, notes):
-    """Add a booster box."""
-    row_id = _insert_item("booster_box", name, set_code, None, lang.upper(), "M",
-                           False, None, False, None, None, None,
-                           price, purchase_date, source, notes)
-    console.print(f"[green]✓[/green] Added booster box [bold]#{row_id}[/bold]: {name}")
+@click.option("--pending",     is_flag=True, default=False, help="Pre-order / not yet arrived")
+def add_box(name, set_code, lang, price, qty, purchase_date, source, notes, pending):
+    """Add a booster box. Use --qty to add multiple copies at the same price."""
+    status = "pending" if pending else "owned"
+    ids = [
+        _insert_item("booster_box", name, set_code, None, lang.upper(), "M",
+                     False, None, False, None, None, None,
+                     price, purchase_date, source, notes, status)
+        for _ in range(qty)
+    ]
+    flag = " [yellow][PENDING][/yellow]" if pending else ""
+    id_s = f"#{ids[0]}" if qty == 1 else f"#{ids[0]}–#{ids[-1]}"
+    console.print(f"[green]✓[/green] Added {qty}× booster box [bold]{id_s}[/bold]: {name}  {price:.2f} € each{flag}")
+    with console.status("[dim]Fetching price…"):
+        _auto_update_multi(ids)
 
 
 @add.command("sealed")
@@ -262,15 +437,26 @@ def add_box(name, set_code, lang, price, purchase_date, source, notes):
 @click.option("--set",   "-s", "set_code",  default=None)
 @click.option("--lang",  "-l", default="EN", type=_LANG_CHOICE, show_default=True)
 @click.option("--price", "-p", required=True, type=float)
+@click.option("--qty",   "-q", default=1, type=click.IntRange(min=1), show_default=True,
+              help="Number of copies to add")
 @click.option("--date",  "-d", "purchase_date", default=str(date.today()))
 @click.option("--source",      default=None)
 @click.option("--notes",       default=None)
-def add_sealed(name, set_code, lang, price, purchase_date, source, notes):
-    """Add a sealed set / special product."""
-    row_id = _insert_item("sealed_set", name, set_code, None, lang.upper(), "M",
-                           False, None, False, None, None, None,
-                           price, purchase_date, source, notes)
-    console.print(f"[green]✓[/green] Added sealed [bold]#{row_id}[/bold]: {name}")
+@click.option("--pending",     is_flag=True, default=False, help="Pre-order / not yet arrived")
+def add_sealed(name, set_code, lang, price, qty, purchase_date, source, notes, pending):
+    """Add a sealed set / special product. Use --qty to add multiple copies at the same price."""
+    status = "pending" if pending else "owned"
+    ids = [
+        _insert_item("sealed_set", name, set_code, None, lang.upper(), "M",
+                     False, None, False, None, None, None,
+                     price, purchase_date, source, notes, status)
+        for _ in range(qty)
+    ]
+    flag = " [yellow][PENDING][/yellow]" if pending else ""
+    id_s = f"#{ids[0]}" if qty == 1 else f"#{ids[0]}–#{ids[-1]}"
+    console.print(f"[green]✓[/green] Added {qty}× sealed [bold]{id_s}[/bold]: {name}  {price:.2f} € each{flag}")
+    with console.status("[dim]Fetching price…"):
+        _auto_update_multi(ids)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -282,8 +468,14 @@ def add_sealed(name, set_code, lang, price, purchase_date, source, notes):
 @click.option("--set",     "set_code",  default=None)
 @click.option("--lang",                default=None)
 @click.option("--graded",  "graded_only", is_flag=True, default=False)
+@click.option("--pending", "pending_only", is_flag=True, default=False,
+              help="Show only pre-orders / items not yet arrived")
+@click.option("--sold",    "sold_only",   is_flag=True, default=False,
+              help="Show only sold items")
+@click.option("--active",  "active_only", is_flag=True, default=False,
+              help="Hide sold items (show owned + pending only)")
 @click.option("--sort",    default="date", type=_SORT_CHOICE, show_default=True)
-def list_items(item_type, set_code, lang, graded_only, sort):
+def list_items(item_type, set_code, lang, graded_only, pending_only, sold_only, active_only, sort):
     """List portfolio items.
 
     \b
@@ -293,7 +485,7 @@ def list_items(item_type, set_code, lang, graded_only, sort):
       optcg list --type card --lang JP    # Japanese singles only
       optcg list --set OP-01              # Romance Dawn set only
       optcg list --graded                 # graded slabs only
-      optcg list --sort price             # sorted by purchase price
+      optcg list --pending                # pre-orders awaiting arrival
     """
     with db_conn() as conn:
         db = Database(conn)
@@ -307,6 +499,12 @@ def list_items(item_type, set_code, lang, graded_only, sort):
             where.append("language = ?");  params.append(lang.upper())
         if graded_only:
             where.append("graded = 1")
+        if pending_only:
+            where.append("status = 'pending'")
+        if sold_only:
+            where.append("status = 'sold'")
+        if active_only:
+            where.append("status != 'sold'")
 
         sql = "SELECT * FROM items"
         if where:
@@ -351,19 +549,35 @@ def list_items(item_type, set_code, lang, graded_only, sort):
         tbl.add_column("Date",                         width=11)
 
         for item, pnl in rows:
-            c = TYPE_COLOR.get(item["item_type"], "white")
-            cur_str = f"{pnl['current']:.2f}" if pnl["current"] is not None else "[dim]—[/dim]"
+            c       = TYPE_COLOR.get(item["item_type"], "white")
+            status  = item["status"] if "status" in item.keys() else "owned"
+            pending = status == "pending"
+            sold    = status == "sold"
+            if sold:
+                cur_str  = f"[dim]{pnl['current']:.2f}[/dim]" if pnl["current"] else "[dim]—[/dim]"
+                name_str = f"[dim strike]{item['name']}[/dim strike]"
+            elif pending:
+                cur_str  = "[yellow]PENDING[/yellow]"
+                name_str = f"[yellow]⏳[/yellow] {item['name']}"
+            else:
+                cur_str  = f"{pnl['current']:.2f}" if pnl["current"] is not None else "[dim]—[/dim]"
+                name_str = item["name"]
+            pnl_str = "[dim]—[/dim]"
+            if sold:
+                pnl_str = _fmt_pnl(pnl["pnl"], pnl["pnl_pct"]) + " [dim][SOLD][/dim]"
+            elif not pending:
+                pnl_str = _fmt_pnl(pnl["pnl"], pnl["pnl_pct"])
             tbl.add_row(
                 str(item["id"]),
                 f"[{c}]{item['item_type']}[/{c}]",
-                item["name"],
+                name_str,
                 item["set_code"] or "—",
                 item["card_number"] or "—",
                 item["language"] or "EN",
                 _fmt_grade(item),
                 f"{item['purchase_price']:.2f}",
                 cur_str,
-                _fmt_pnl(pnl["pnl"], pnl["pnl_pct"]),
+                pnl_str,
                 item["purchase_date"],
             )
 
@@ -546,7 +760,12 @@ def show_item(item_id: int):
 @click.option("--grade",     "-g", default=None)
 @click.option("--cert",      default=None)
 @click.option("--lang",      "-l", default=None, type=_LANG_CHOICE)
-def edit_item(item_id, name, condition, price, purchase_date, source, notes, variant, grade, cert, lang):
+@click.option("--arrived",   is_flag=True, default=False,
+              help="Mark a pending pre-order as arrived/owned")
+@click.option("--pending",   is_flag=True, default=False,
+              help="Mark an item as a pending pre-order")
+def edit_item(item_id, name, condition, price, purchase_date, source, notes,
+              variant, grade, cert, lang, arrived, pending):
     """Edit fields on an existing item.
 
     \b
@@ -555,7 +774,7 @@ def edit_item(item_id, name, condition, price, purchase_date, source, notes, var
       optcg edit 3 --price 55.00
       optcg edit 3 --grade 9.5 --cert 87654321
       optcg edit 3 --notes "bought at GP Madrid"
-      optcg edit 3 --variant "Full Art"
+      optcg edit 3 --arrived           # pre-order landed, mark as owned
     """
     field_map = [
         ("name", name), ("condition", condition), ("purchase_price", price),
@@ -564,6 +783,10 @@ def edit_item(item_id, name, condition, price, purchase_date, source, notes, var
         ("cert_number", cert), ("language", lang),
     ]
     updates = [(f, v) for f, v in field_map if v is not None]
+    if arrived:
+        updates.append(("status", "owned"))
+    elif pending:
+        updates.append(("status", "pending"))
     if not updates:
         console.print("[yellow]Nothing to update. Pass at least one option.[/yellow]")
         return
@@ -578,7 +801,62 @@ def edit_item(item_id, name, condition, price, purchase_date, source, notes, var
             f"UPDATE items SET {fields_sql}, updated_at = datetime('now') WHERE id = ?",
             tuple(values),
         )
-    console.print(f"[green]✓[/green] Updated #{item_id}")
+    status_msg = ("  [green]Marked as arrived ✓[/green]" if arrived else
+                  "  [yellow]Marked as pending ⏳[/yellow]" if pending else "")
+    console.print(f"[green]✓[/green] Updated #{item_id}{status_msg}")
+    _regen_dashboard()
+
+
+@main.command("sell")
+@click.argument("item_id", type=int)
+@click.option("--price",  "-p", "sell_price", required=True, type=float, help="Sell price (EUR)")
+@click.option("--date",   "-d", "sell_date",  default=str(date.today()), show_default=True)
+@click.option("--source",       "sell_source", default=None, help="CardMarket / eBay / LGS / ...")
+@click.option("--notes",        default=None,  help="Append to existing notes")
+def sell_item(item_id, sell_price, sell_date, sell_source, notes):
+    """Mark an item as sold and record the sale price.
+
+    Receipts, price history and all data are kept for tax / metric purposes.
+
+    \b
+    Examples:
+      optcg sell 7 --price 180.00
+      optcg sell 7 --price 180.00 --source CardMarket --date 2026-04-20
+    """
+    with db_conn() as conn:
+        db = Database(conn)
+        item = db.fetchone("SELECT * FROM items WHERE id = ?", (item_id,))
+        if not item:
+            console.print(f"[red]Item #{item_id} not found.[/red]"); sys.exit(1)
+        if (item["status"] if "status" in item.keys() else "owned") == "sold":
+            console.print(f"[yellow]Item #{item_id} is already marked as sold.[/yellow]")
+            return
+
+        # Append sell note if provided
+        existing_notes = item["notes"] or ""
+        merged_notes   = f"{existing_notes}\nSold {sell_date} via {sell_source or '?'}: {sell_price:.2f} €".strip() \
+                         if not notes else \
+                         f"{existing_notes}\n{notes}".strip()
+
+        db.execute(
+            """UPDATE items
+               SET status = 'sold', sell_price = ?, sell_date = ?, sell_source = ?,
+                   notes = ?, updated_at = datetime('now')
+               WHERE id = ?""",
+            (sell_price, sell_date, sell_source, merged_notes, item_id),
+        )
+
+    cost    = item["purchase_price"]
+    pnl     = sell_price - cost
+    pnl_pct = (pnl / cost * 100) if cost else 0.0
+    sg      = "+" if pnl >= 0 else ""
+    color   = "green" if pnl >= 0 else "red"
+    console.print(
+        f"[green]✓[/green] Sold #{item_id}: {item['name']}\n"
+        f"  Bought [cyan]{cost:.2f} €[/cyan]  →  Sold [{color}]{sell_price:.2f} €[/{color}]  "
+        f"[{color}]{sg}{pnl:.2f} € ({sg}{pnl_pct:.1f}%)[/{color}]"
+    )
+    _regen_dashboard()
 
 
 @main.command("remove")
@@ -595,6 +873,7 @@ def remove_item(item_id, yes):
             click.confirm(f"Remove #{item_id} '{item['name']}'?", abort=True)
         db.execute("DELETE FROM items WHERE id = ?", (item_id,))
     console.print(f"[red]Removed[/red] #{item_id}: {item['name']}")
+    _regen_dashboard()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -764,57 +1043,108 @@ def price_update(item_id, all_items):
             return
 
         updated = failed = 0
+        _SEALED_TYPES = {"booster_box", "blister", "sealed_set"}
+
+        # ── Deduplicate: group items with identical market identity ────────────
+        # Same name + set + language + type → same price. Fetch once, apply all.
+        import time as _time
+        from collections import defaultdict
+        groups: dict[tuple, list] = defaultdict(list)
+        for item in items:
+            key = (item["name"], item["set_code"] or "", item["language"] or "EN",
+                   item["item_type"])
+            groups[key].append(item)
 
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                       console=console) as prog:
-            for item in items:
-                task = prog.add_task(f"[cyan]{item['name'][:45]}[/cyan]", total=None)
+            for group_items in groups.values():
+                representative = group_items[0]
+                ids = [i["id"] for i in group_items]
+                qty = len(ids)
+                label = representative["name"][:40]
+                if qty > 1:
+                    label += f" ×{qty}"
+                task = prog.add_task(f"[cyan]{label}[/cyan]", total=None)
                 saved = False
 
                 # ── CardMarket ────────────────────────────────────────────────
+                known_url = (representative["cardmarket_url"]
+                             if "cardmarket_url" in representative.keys() else None)
                 cm = get_card_prices(
-                    item["name"], item["set_code"], item["card_number"],
-                    item["language"], item["item_type"],
+                    representative["name"], representative["set_code"],
+                    representative["card_number"], representative["language"],
+                    representative["item_type"], known_url=known_url,
                 )
                 for ptype in ("trend", "low", "market"):
                     if cm.get(ptype):
-                        db.execute(
-                            "INSERT INTO price_snapshots "
-                            "(item_id, source, price_type, price, url) VALUES (?,?,?,?,?)",
-                            (item["id"], "cardmarket", ptype, cm[ptype], cm.get("url")),
-                        )
+                        for iid in ids:
+                            db.execute(
+                                "INSERT INTO price_snapshots "
+                                "(item_id, source, price_type, price, url) VALUES (?,?,?,?,?)",
+                                (iid, "cardmarket", ptype, cm[ptype], cm.get("url")),
+                            )
                         saved = True
+                # Cache the hit URL + image on all items in the group
+                if cm.get("url"):
+                    for iid in ids:
+                        db.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?",
+                                   (cm["url"], iid))
+                if cm.get("img"):
+                    for iid in ids:
+                        db.execute("UPDATE items SET cardmarket_img = ? WHERE id = ?",
+                                   (cm["img"], iid))
 
                 # ── eBay sold comps ────────────────────────────────────────────
-                query = f"One Piece {item['card_number'] or ''} {item['name']}".strip()
-                sold  = search_sold_listings(query, max_results=5)
+                query = (f"One Piece {representative['card_number'] or ''} "
+                         f"{representative['name']}").strip()
+                sold = search_sold_listings(query, max_results=5)
+                avg  = None
                 if sold:
                     avg = sum(l["price"] for l in sold) / len(sold)
-                    db.execute(
-                        "INSERT INTO price_snapshots "
-                        "(item_id, source, price_type, price) VALUES (?,?,?,?)",
-                        (item["id"], "ebay", "sold_avg", avg),
-                    )
+                    for iid in ids:
+                        db.execute(
+                            "INSERT INTO price_snapshots "
+                            "(item_id, source, price_type, price) VALUES (?,?,?,?)",
+                            (iid, "ebay", "sold_avg", avg),
+                        )
                     saved = True
 
                 prog.remove_task(task)
 
-                if saved:
-                    updated += 1
-                    parts = []
-                    if cm.get("trend"): parts.append(f"CM trend: {cm['trend']:.2f} €")
-                    if sold:            parts.append(f"eBay avg: {avg:.2f} €")
-                    console.print(f"  [green]✓[/green] #{item['id']} {item['name'][:38]:<38}  {'  |  '.join(parts)}")
-                else:
-                    failed += 1
-                    err = cm.get("error") or "no data"
-                    console.print(f"  [red]✗[/red] #{item['id']} {item['name'][:38]:<38}  {err}")
+                # For sealed products prefer "low" (language-filtered min listing)
+                # over "trend" (global cross-language average)
+                is_sealed = representative["item_type"] in _SEALED_TYPES
+                cm_price  = cm.get("low") or cm.get("trend")
+                cm_label  = "CM low" if cm.get("low") else "CM trend"
 
-        # Auto-export CSVs after updating
-        auto_export(db)
+                id_range = f"#{ids[0]}" if qty == 1 else f"#{ids[0]}–#{ids[-1]}"
+                if saved:
+                    updated += qty
+                    parts = []
+                    if cm_price:  parts.append(f"{cm_label}: {cm_price:.2f} €")
+                    if avg:       parts.append(f"eBay avg: {avg:.2f} €")
+                    console.print(
+                        f"  [green]✓[/green] {id_range} {representative['name'][:35]:<35}"
+                        f"  {'  |  '.join(parts)}"
+                    )
+                else:
+                    failed += qty
+                    err = cm.get("error") or "No prices found on CardMarket for this query"
+                    console.print(
+                        f"  [red]✗[/red] {id_range} {representative['name'][:35]:<35}  {err}\n"
+                        f"     [dim]→ set manually: optcg price set {ids[0]} <price>[/dim]"
+                    )
+
+                # Throttle between groups to avoid CM rate-limiting
+                if len(groups) > 1:
+                    _time.sleep(1.0)
+
+    # Auto-export OUTSIDE the transaction — if this fails it must not rollback
+    # the price inserts that were just committed.
+    _regen_dashboard()
 
     console.print(
-        f"\n[green]Updated {updated}[/green]  [red]failed {failed}[/red]"
+        f"\n[green]Updated {updated}[/green]  [red]Failed {failed}[/red]"
         f"  [dim]CSVs → {EXPORTS_DIR}[/dim]"
     )
 
@@ -841,6 +1171,25 @@ def price_set(item_id, price_value, price_type):
             (item_id, "manual", price_type, price_value),
         )
     console.print(f"[green]✓[/green] #{item_id} price set to {price_value:.2f} EUR [{price_type}]")
+    _regen_dashboard()
+
+
+@price.command("set-url")
+@click.argument("item_id", type=int)
+@click.argument("url")
+def price_set_url(item_id, url):
+    """Cache the CardMarket product URL for an item (used as starting point for future updates).
+
+    \b
+    Example:
+      optcg price set-url 8 "https://www.cardmarket.com/en/OnePiece/Products/Booster-Boxes/The-Azure-Seas-Seven-Booster-Box?language=1"
+    """
+    with db_conn() as conn:
+        db = Database(conn)
+        if not db.fetchone("SELECT id FROM items WHERE id = ?", (item_id,)):
+            console.print(f"[red]Item #{item_id} not found.[/red]"); sys.exit(1)
+        db.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?", (url, item_id))
+    console.print(f"[green]✓[/green] #{item_id} CardMarket URL cached.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1399,6 +1748,306 @@ def db_stats():
         f"[bold]iCloud dir:[/bold]     {APP_DIR}",
         title="Stats", border_style="dim",
     ))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DASHBOARD (static HTML export)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@main.command("dashboard")
+@click.option("--out", default=None, type=click.Path(path_type=Path),
+              help="Custom output path (default: iCloud exports/dashboard.html)")
+def dashboard_cmd(out):
+    """Generate the HTML dashboard and open it.
+
+    Also runs automatically after every `optcg price update --all`.
+
+    \b
+    Examples:
+      optcg dashboard
+      optcg dashboard --out ~/Desktop/portfolio.html
+    """
+    from optcg.export_html import generate_html
+    with db_conn() as conn:
+        db = Database(conn)
+        path = generate_html(db, Path(out) if out else None)
+    console.print(f"[green]✓[/green] Dashboard: {path}")
+    subprocess.Popen(["open", str(path)])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI DASHBOARD  (terminal view)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_timeline(db: Database) -> list[dict]:
+    """Portfolio value + invested per day, using last snapshot per item per day."""
+    items_raw = db.fetchall("SELECT * FROM items")
+    # Last-inserted snapshot per item per calendar day (trend/low/manual only)
+    snaps = db.fetchall(
+        "SELECT item_id, price, substr(fetched_at,1,10) AS date "
+        "FROM price_snapshots "
+        "WHERE id IN ("
+        "  SELECT MAX(id) FROM price_snapshots "
+        "  WHERE price_type IN ('trend','low','manual') "
+        "  GROUP BY item_id, substr(fetched_at,1,10)"
+        ") ORDER BY date ASC"
+    )
+    if not snaps:
+        return []
+
+    dates  = sorted({s["date"] for s in snaps})
+    by_dt: dict[str, dict] = {}
+    for s in snaps:
+        by_dt.setdefault(s["date"], {})[s["item_id"]] = s["price"]
+
+    rolling: dict = {}
+    timeline: list[dict] = []
+    for d in dates:
+        rolling.update(by_dt[d])
+        tv = ti = 0.0
+        for item in items_raw:
+            if item["purchase_date"] <= d and \
+               (item["status"] if "status" in item.keys() else "owned") != "sold":
+                ti += item["purchase_price"]
+                tv += rolling.get(item["id"], item["purchase_price"])
+        timeline.append({"date": d, "value": round(tv, 2), "invested": round(ti, 2)})
+    return timeline
+
+
+def _render_timeline_chart(timeline: list[dict], width: int = 64, height: int = 8) -> list[str]:
+    """Render a multi-row line chart; returns list of Rich-markup strings."""
+    if len(timeline) < 2:
+        return []
+
+    values   = [t["value"]    for t in timeline]
+    invested = [t["invested"] for t in timeline]
+    dates    = [t["date"]     for t in timeline]
+    n        = len(timeline)
+
+    all_vals = values + invested
+    y_min = min(all_vals) * 0.97
+    y_max = max(all_vals) * 1.03
+    y_rng = y_max - y_min or 1.0
+
+    # Column position for each data point (0 … width-1)
+    col_pos = [round(i / (n - 1) * (width - 1)) for i in range(n)]
+
+    def to_row(v: float) -> int:
+        return max(0, min(height - 1,
+                          height - 1 - round((v - y_min) / y_rng * (height - 1))))
+
+    val_rows = [to_row(v) for v in values]
+    inv_rows = [to_row(v) for v in invested]
+
+    # Grid: (char, kind)  kind ∈ 'val','inv','empty'
+    grid: list[list[tuple]] = [[(' ', 'empty')] * width for _ in range(height)]
+
+    def _fill_line(rows_list, cols_list, kind):
+        for i in range(len(cols_list)):
+            r, c = rows_list[i], cols_list[i]
+            mark = '●' if kind == 'val' else '─'
+            grid[r][c] = (mark, kind)
+            if i > 0:
+                pr, pc = rows_list[i - 1], cols_list[i - 1]
+                for cc in range(pc + 1, c):
+                    t  = (cc - pc) / max(1, c - pc)
+                    rr = round(pr + t * (r - pr))
+                    rr = max(0, min(height - 1, rr))
+                    dr = r - pr
+                    if kind == 'val':
+                        ch = '╱' if dr < 0 else ('╲' if dr > 0 else '─')
+                    else:
+                        ch = '─'
+                    # Only overwrite empty cells for the invested line
+                    if kind == 'val' or grid[rr][cc][1] == 'empty':
+                        grid[rr][cc] = (ch, kind)
+
+    _fill_line(inv_rows, col_pos, 'inv')
+    _fill_line(val_rows, col_pos, 'val')
+
+    LABEL_W = 9  # width of y-axis label + separator
+
+    lines: list[str] = []
+    for row in range(height):
+        y_val = y_max - (row / max(1, height - 1)) * y_rng
+        label = f"{y_val:>7,.0f} │"
+        row_str = [f"[dim]{label}[/dim]"]
+        for col in range(width):
+            ch, kind = grid[row][col]
+            if kind == 'val':
+                row_str.append(f"[bold yellow]{ch}[/bold yellow]"
+                                if ch == '●' else f"[yellow]{ch}[/yellow]")
+            elif kind == 'inv':
+                row_str.append(f"[dim]{ch}[/dim]")
+            else:
+                row_str.append(ch)
+        lines.append("".join(row_str))
+
+    # X-axis rule
+    lines.append(f"[dim]{'':>7} └{'─' * width}[/dim]")
+
+    # X-axis date labels — spread evenly, at most 5
+    n_lbls = min(n, max(2, width // 10))
+    lbl_idx = [round(i / (n_lbls - 1) * (n - 1)) for i in range(n_lbls)]
+    x_chars = [' '] * width
+    for li in lbl_idx:
+        col   = col_pos[li]
+        label = dates[li][5:]          # MM-DD
+        start = max(0, min(width - len(label), col - len(label) // 2))
+        for k, c in enumerate(label):
+            if start + k < width:
+                x_chars[start + k] = c
+    lines.append(f"[dim]{'':>9}{''.join(x_chars)}[/dim]")
+
+    # Legend
+    lines.append(
+        f"{'':>9}[yellow]●[/yellow] [dim]Value[/dim]   "
+        f"[dim]─ Invested[/dim]"
+    )
+    return lines
+
+
+@main.command("dash")
+def dash_cmd():
+    """Terminal dashboard — portfolio at a glance.
+
+    \b
+    Shows portfolio summary, all items with P&L, and a text P&L bar chart.
+    """
+    from rich.columns import Columns
+    from rich.text import Text
+    from datetime import datetime as _dt
+
+    with db_conn() as conn:
+        db = Database(conn)
+        summary = portfolio_summary(db)
+        items_raw = db.fetchall("SELECT * FROM items ORDER BY purchase_date DESC, id DESC")
+        rows = [(item, item_pnl(item, db)) for item in items_raw]
+        receipt_ids = {r["item_id"] for r in db.fetchall("SELECT DISTINCT item_id FROM receipts")}
+        timeline = _build_timeline(db)
+
+    unrealized     = summary["unrealized_pnl"] or 0
+    unrealized_pct = summary["unrealized_pnl_pct"] or 0
+    realized       = summary["realized_pnl"] or 0
+    realized_pct   = summary["realized_pnl_pct"] or 0
+    invested       = summary["active_invested"] or 0
+    current        = summary["active_current_value"] or 0
+    u_color        = "green" if unrealized >= 0 else "red"
+    r_color        = "green" if realized   >= 0 else "red"
+    u_sg           = "+" if unrealized >= 0 else ""
+    r_sg           = "+" if realized   >= 0 else ""
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    now_str = _dt.now().strftime("%Y-%m-%d %H:%M")
+    console.rule(f"[bold yellow]OPTCG Tracker[/bold yellow]  [dim]{now_str}[/dim]")
+
+    # ── Stat panels ───────────────────────────────────────────────────────────
+    def stat_panel(title, value, sub="", color="yellow"):
+        return Panel(
+            f"[bold {color}]{value}[/bold {color}]\n[dim]{sub}[/dim]",
+            title=f"[dim]{title}[/dim]", border_style="dim",
+            padding=(0, 2),
+        )
+
+    panels = [
+        stat_panel("Invested",     f"{invested:,.2f} €",
+                   f"{summary['item_count']} active item{'s' if summary['item_count']!=1 else ''}"),
+        stat_panel("Current Value",f"{current:,.2f} €",
+                   f"{summary['items_with_price']} priced"),
+        stat_panel("Unrealized P&L", f"{u_sg}{unrealized:,.2f} €",
+                   f"{u_sg}{unrealized_pct:.1f}%", u_color),
+        stat_panel("Realized P&L",   f"{r_sg}{realized:,.2f} €",
+                   f"{r_sg}{realized_pct:.1f}%  ·  {summary['sold_count']} sold", r_color),
+    ]
+    console.print(Columns(panels, equal=True, expand=True))
+
+    console.print()
+
+    # ── Items table ───────────────────────────────────────────────────────────
+    TYPE_COLOR = {
+        "card": "white", "promo": "magenta",
+        "blister": "cyan", "booster_box": "blue", "sealed_set": "yellow",
+    }
+    tbl = Table(show_header=True, header_style="bold cyan", box=box.ROUNDED, expand=True)
+    tbl.add_column("#",       style="dim",     width=4)
+    tbl.add_column("Name",    min_width=26,    no_wrap=False)
+    tbl.add_column("Type",    width=11)
+    tbl.add_column("Set",     width=7)
+    tbl.add_column("Lang",    width=5)
+    tbl.add_column("Paid €",  justify="right", width=9)
+    tbl.add_column("Now €",   justify="right", width=10)
+    tbl.add_column("P&L €",   justify="right", width=11)
+    tbl.add_column("P&L %",   justify="right", width=8)
+    tbl.add_column("Date",    width=11)
+
+    for item, p in rows:
+        tc      = TYPE_COLOR.get(item["item_type"], "white")
+        status  = item["status"] if "status" in item.keys() else "owned"
+        pending = status == "pending"
+        sold    = status == "sold"
+        has_rcp = item["id"] in receipt_ids
+        rcp_tag = " [blue dim][RCP][/blue dim]" if has_rcp else ""
+
+        if sold:
+            cur_s  = (f"[green]{p['current']:.2f}[/green]"
+                      if p["current"] is not None else "[dim]—[/dim]")
+            name_s = f"[dim strike]{item['name']}[/dim strike]{rcp_tag} [green dim][SOLD][/green dim]"
+        elif pending:
+            cur_s  = (f"[yellow]{p['current']:.2f}[/yellow]"
+                      if p["current"] is not None else "[yellow]—[/yellow]")
+            name_s = f"[yellow]⏳[/yellow] {item['name']}{rcp_tag}"
+        else:
+            cur_s  = (f"{p['current']:.2f}" if p["current"] is not None else "[dim]—[/dim]")
+            name_s = f"{item['name']}{rcp_tag}"
+
+        pnl_s = "[dim]—[/dim]"
+        pct_s = "[dim]—[/dim]"
+        if p["pnl"] is not None:
+            c2    = "green" if p["pnl"] >= 0 else "red"
+            sg2   = "+" if p["pnl"] >= 0 else ""
+            pnl_s = f"[{c2}]{sg2}{p['pnl']:.2f}[/{c2}]"
+            pct_s = f"[{c2}]{sg2}{p['pnl_pct']:.1f}%[/{c2}]"
+            if sold:
+                pct_s += " [green dim][R][/green dim]"
+
+        tbl.add_row(
+            str(item["id"]), name_s,
+            f"[{tc}]{item['item_type']}[/{tc}]",
+            item["set_code"] or "—", item["language"] or "EN",
+            f"{item['purchase_price']:.2f}", cur_s, pnl_s, pct_s,
+            item["purchase_date"],
+        )
+
+    console.print(tbl)
+    console.print(f"[dim]{len(rows)} item(s)[/dim]")
+
+    # ── Portfolio value over time ─────────────────────────────────────────────
+    chart_lines = _render_timeline_chart(timeline, width=64, height=8)
+    if chart_lines:
+        console.print()
+        console.rule("[dim]Portfolio value over time[/dim]")
+        for line in chart_lines:
+            console.print(line)
+
+    # ── P&L bar chart (text) ──────────────────────────────────────────────────
+    priced = [(item["name"], p["pnl"]) for item, p in rows if p["pnl"] is not None]
+    if priced:
+        console.print()
+        console.rule("[dim]P&L per item[/dim]")
+        max_abs = max(abs(v) for _, v in priced) or 1
+        BAR = 28
+        for name, v in sorted(priced, key=lambda x: -x[1]):
+            blen = int(abs(v) / max_abs * BAR)
+            if v >= 0:
+                bar  = f"[green]{'█' * blen}[/green]"
+                val  = f"[green]+{v:.2f} €[/green]"
+            else:
+                bar  = f"[red]{'█' * blen}[/red]"
+                val  = f"[red]{v:.2f} €[/red]"
+            label = name[:26].ljust(26)
+            console.print(f"  [dim]{label}[/dim]  {bar:<30}  {val}")
+
+    console.rule()
 
 
 if __name__ == "__main__":

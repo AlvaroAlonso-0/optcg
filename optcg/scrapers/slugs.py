@@ -18,6 +18,13 @@ SET_SLUGS: dict[str, str] = {
     "OP-08": "ONE-PIECE-CARD-GAME-Two-Legends",
     "OP-09": "ONE-PIECE-CARD-GAME-The-Four-Emperors",
     "OP-10": "ONE-PIECE-CARD-GAME-Emperors-in-the-New-World",
+    "OP-11": "ONE-PIECE-CARD-GAME-Mighty-Enemies",
+    "OP-12": "ONE-PIECE-CARD-GAME-Side-Quest-The-Wings-of-Straw-Hat",
+    "OP-13": "ONE-PIECE-CARD-GAME-Hero-of-Justice",
+    "OP-14": "ONE-PIECE-CARD-GAME-The-Azure-Seas-Seven",
+    "OP-15": "ONE-PIECE-CARD-GAME-Adventure-on-Kamis-Island",
+    "OP-16": "ONE-PIECE-CARD-GAME-The-Time-of-Battle",
+    "OP-17": "ONE-PIECE-CARD-GAME-The-Worlds-Strongest-Warriors",
     # Extra / Premium boosters
     "EB-01": "ONE-PIECE-CARD-GAME-Extra-Booster-Memorial-Collection",
     "PRB-01": "ONE-PIECE-CARD-GAME-Premium-Booster-THE-BEST",
@@ -80,14 +87,27 @@ def card_url(set_code: str, card_name: str, language: str = None) -> str | None:
     return url
 
 
-def box_url(set_code: str, box_name: str) -> str | None:
-    box_slug = name_to_slug(box_name)
-    return f"{CM_BASE}/Products/Booster-Boxes/{box_slug}"
+def box_url(set_code: str, box_name: str, language: str = None) -> str | None:
+    # CardMarket uses "OP17-Booster-Box" style slugs (no hyphen between prefix
+    # and number) for main-series booster boxes, regardless of item display name.
+    import re as _re
+    m = _re.match(r'^([A-Z]+)-?(\d+)$', (set_code or "").upper().strip())
+    if m:
+        box_slug = f"{m.group(1)}{m.group(2)}-Booster-Box"
+    else:
+        box_slug = name_to_slug(box_name)
+    url = f"{CM_BASE}/Products/Booster-Boxes/{box_slug}"
+    if language and language.upper() in LANGUAGE_CM_CODES:
+        url += f"?language={LANGUAGE_CM_CODES[language.upper()]}"
+    return url
 
 
-def sealed_url(product_name: str) -> str:
+def sealed_url(product_name: str, language: str = None) -> str:
     slug = name_to_slug(product_name)
-    return f"{CM_BASE}/Products/Sealed-Products/{slug}"
+    url = f"{CM_BASE}/Products/Sealed-Products/{slug}"
+    if language and language.upper() in LANGUAGE_CM_CODES:
+        url += f"?language={LANGUAGE_CM_CODES[language.upper()]}"
+    return url
 
 
 def search_url(query: str, language: str = None) -> str:

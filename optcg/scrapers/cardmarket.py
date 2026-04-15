@@ -458,11 +458,11 @@ def _parse_eur(text: str) -> Optional[float]:
         return None
 
 
-def _parse_prices(html: str) -> dict:
+def _parse_prices(html: str, language_filtered: bool = False) -> dict:
     soup   = BeautifulSoup(html, "lxml")
     prices: dict[str, float] = {}
 
-    # Strategy 1 — <dl> info tables
+    # Strategy 1 — <dl> info tables (info-box: trend/from/market)
     for dl in soup.select("dl"):
         for dt, dd in zip(dl.select("dt"), dl.select("dd")):
             key = dt.get_text(strip=True).lower()
@@ -498,6 +498,44 @@ def _parse_prices(html: str) -> dict:
                 prices["trend"] = p
                 break
 
+    # Strategy 4 — article listing prices (language-filtered product pages)
+    # When ?language=N is set, the listed articles are already filtered.
+    # The info-box "trend" is global (all languages) so we scrape the actual
+    # offer rows to get the real minimum EN/JP price.
+    if language_filtered:
+        article_prices: list[float] = []
+        # CardMarket uses .article-row or table rows inside .article-list/.table-body
+        for selector in (
+            ".article-row .col-offer-price span",
+            ".article-row span.color-primary",
+            "table.article-table td.col-offer-price span",
+            ".table-body .col-offer-price span.color-primary",
+            "td.col-sellerProductInfo ~ td span.color-primary",
+            # Fallback: any span.color-primary inside a row-like container,
+            # skipping the first (header trend)
+        ):
+            candidates = [_parse_eur(s.get_text(strip=True))
+                          for s in soup.select(selector)]
+            candidates = [p for p in candidates if p]
+            if candidates:
+                article_prices.extend(candidates)
+                break
+
+        if article_prices:
+            article_min = min(article_prices)
+            # Override info-box "low" with the actual cheapest language-specific listing
+            prices["low"] = article_min
+            # The info-box trend is cross-language; don't trust it when we have
+            # real article data — store as a separate key so callers can choose.
+            prices["article_min"] = article_min
+
+    # Image — og:image meta tag; skip the generic CM fallback logo
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        src = og["content"]
+        if "logos/cardmarket" not in src and "cardmarket-logo" not in src:
+            prices["img"] = src
+
     return prices
 
 
@@ -529,37 +567,67 @@ def get_card_prices(
     card_number: str = None,
     language: str = None,
     item_type: str = "card",
+    known_url: str = None,
 ) -> dict:
     """
     Fetch CardMarket prices for any One Piece product.
+
+    known_url: previously cached CM product URL — tried first, skips slug/search.
     Returns: {trend, low, market, url, error}
     """
     result: dict = {
         "trend": None, "low": None, "market": None,
-        "url": None, "error": None,
+        "url": None, "img": None, "error": None,
     }
     session = _make_session()
 
-    # ── Direct URL ────────────────────────────────────────────────────────────
+    _is_lang_filtered = language is not None and item_type in (
+        "booster_box", "blister", "sealed_set"
+    )
+
+    # ── Known URL (cached from previous successful fetch) ─────────────────────
+    if known_url:
+        html = _fetch(known_url, session)
+        if html:
+            prices = _parse_prices(html, language_filtered=_is_lang_filtered)
+            if prices:
+                result.update(prices)
+                result["url"] = known_url
+                return result
+
+    # ── Derived direct URL ────────────────────────────────────────────────────
     direct_url = None
     if set_code and item_type in ("card", "promo"):
         direct_url = card_url(set_code, name, language)
     elif item_type == "booster_box":
-        direct_url = box_url(set_code or "", name)
+        direct_url = box_url(set_code or "", name, language)
     elif item_type in ("blister", "sealed_set"):
-        direct_url = sealed_url(name)
+        direct_url = sealed_url(name, language)
 
-    if direct_url:
+    if direct_url and direct_url != known_url:
         html = _fetch(direct_url, session)
         if html:
-            prices = _parse_prices(html)
+            prices = _parse_prices(html, language_filtered=_is_lang_filtered)
             if prices:
                 result.update(prices)
                 result["url"] = direct_url
                 return result
 
     # ── Search fallback ───────────────────────────────────────────────────────
-    query = f"{card_number} {name}".strip() if card_number else name
+    # For sealed products (booster boxes, blisters) CardMarket lists EN and JP
+    # as separate product pages — inject language into the search query so the
+    # correct edition is returned.  Sealed products are always mint/sealed, so
+    # no condition filtering is needed.
+    _SEALED_TYPES = ("booster_box", "blister", "sealed_set")
+    if item_type in _SEALED_TYPES and language:
+        lang_label = {"EN": "English", "JP": "Japanese"}.get(
+            language.upper(), language.upper()
+        )
+        query = f"{name} {lang_label}"
+    elif card_number:
+        query = f"{card_number} {name}"
+    else:
+        query = name
     s_url = search_url(query, language)
     html  = _fetch(s_url, session)
 

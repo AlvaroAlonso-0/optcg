@@ -100,6 +100,8 @@ def export_price_history_csv(db: Database, path: Optional[Path] = None) -> Path:
 
 
 def auto_export(db: Database) -> tuple[Path, Path]:
-    """Export both CSVs to the iCloud exports directory."""
+    """Export CSVs + regenerate the HTML dashboard to iCloud exports directory."""
+    from optcg.export_html import generate_html
     EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    generate_html(db)
     return export_portfolio_csv(db), export_price_history_csv(db)
