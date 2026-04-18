@@ -1375,6 +1375,7 @@ class OptcgTUI(App):
                         rep["name"], rep["set_code"], rep["card_number"],
                         rep["language"], rep["item_type"],
                         known_url=rep.get("cardmarket_url"),
+                        condition=rep.get("condition"),
                     )
                     with db_conn() as conn:
                         db = Database(conn)
