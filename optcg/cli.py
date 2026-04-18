@@ -106,7 +106,8 @@ def _auto_update(item_id: int) -> None:
             saved = False
             known_url = item["cardmarket_url"] if "cardmarket_url" in item.keys() else None
             cm = get_card_prices(item["name"], item["set_code"], item["card_number"],
-                                 item["language"], item["item_type"], known_url=known_url)
+                                 item["language"], item["item_type"], known_url=known_url,
+                                 condition=item["condition"])
             for ptype in ("trend", "low", "market"):
                 if cm.get(ptype):
                     db.execute(
@@ -165,7 +166,8 @@ def _auto_update_multi(item_ids: list[int]) -> None:
             saved = False
             known_url = item["cardmarket_url"] if "cardmarket_url" in item.keys() else None
             cm = get_card_prices(item["name"], item["set_code"], item["card_number"],
-                                 item["language"], item["item_type"], known_url=known_url)
+                                 item["language"], item["item_type"], known_url=known_url,
+                                 condition=item["condition"])
             for ptype in ("trend", "low", "market"):
                 if cm.get(ptype):
                     for iid in item_ids:
@@ -533,18 +535,20 @@ def add_sealed(name, set_code, lang, price, qty, purchase_date, source, notes, p
 # ══════════════════════════════════════════════════════════════════════════════
 
 @main.command("list")
-@click.option("--type",    "item_type", default=None, type=_TYPE_CHOICE)
-@click.option("--set",     "set_code",  default=None)
-@click.option("--lang",                default=None)
-@click.option("--graded",  "graded_only", is_flag=True, default=False)
-@click.option("--pending", "pending_only", is_flag=True, default=False,
+@click.option("--type",      "item_type",   default=None, type=_TYPE_CHOICE)
+@click.option("--set",       "set_code",    default=None)
+@click.option("--lang",                     default=None)
+@click.option("--condition", "-c",          default=None, type=_COND_CHOICE,
+              help="Filter by condition (M/NM/LP/MP/HP/PL)")
+@click.option("--graded",    "graded_only", is_flag=True, default=False)
+@click.option("--pending",   "pending_only", is_flag=True, default=False,
               help="Show only pre-orders / items not yet arrived")
-@click.option("--sold",    "sold_only",   is_flag=True, default=False,
+@click.option("--sold",      "sold_only",   is_flag=True, default=False,
               help="Show only sold items")
-@click.option("--active",  "active_only", is_flag=True, default=False,
+@click.option("--active",    "active_only", is_flag=True, default=False,
               help="Hide sold items (show owned + pending only)")
-@click.option("--sort",    default="date", type=_SORT_CHOICE, show_default=True)
-def list_items(item_type, set_code, lang, graded_only, pending_only, sold_only, active_only, sort):
+@click.option("--sort",      default="date", type=_SORT_CHOICE, show_default=True)
+def list_items(item_type, set_code, lang, condition, graded_only, pending_only, sold_only, active_only, sort):
     """List portfolio items.
 
     \b
@@ -553,6 +557,7 @@ def list_items(item_type, set_code, lang, graded_only, pending_only, sold_only, 
       optcg list --sort pnl               # best P&L at top
       optcg list --type card --lang JP    # Japanese singles only
       optcg list --set OP-01              # Romance Dawn set only
+      optcg list --condition NM           # Near Mint items only
       optcg list --graded                 # graded slabs only
       optcg list --pending                # pre-orders awaiting arrival
     """
@@ -566,6 +571,8 @@ def list_items(item_type, set_code, lang, graded_only, pending_only, sold_only, 
             where.append("set_code = ?");  params.append(set_code.upper())
         if lang:
             where.append("language = ?");  params.append(lang.upper())
+        if condition:
+            where.append("condition = ?"); params.append(condition.upper())
         if graded_only:
             where.append("graded = 1")
         if pending_only:
@@ -1275,13 +1282,13 @@ def price_update(item_id, all_items):
         _SEALED_TYPES = {"booster_box", "blister", "sealed_set"}
 
         # ── Deduplicate: group items with identical market identity ────────────
-        # Same name + set + language + type → same price. Fetch once, apply all.
+        # Same name + set + language + condition + type → same price. Fetch once, apply all.
         import time as _time
         from collections import defaultdict
         groups: dict[tuple, list] = defaultdict(list)
         for item in items:
             key = (item["name"], item["set_code"] or "", item["language"] or "EN",
-                   item["item_type"])
+                   item["condition"] or "", item["item_type"])
             groups[key].append(item)
 
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
@@ -1303,6 +1310,7 @@ def price_update(item_id, all_items):
                     representative["name"], representative["set_code"],
                     representative["card_number"], representative["language"],
                     representative["item_type"], known_url=known_url,
+                    condition=representative["condition"],
                 )
                 for ptype in ("trend", "low", "market"):
                     if cm.get(ptype):

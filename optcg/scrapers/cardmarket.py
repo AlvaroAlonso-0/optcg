@@ -674,11 +674,14 @@ def get_card_prices(
     language: str = None,
     item_type: str = "card",
     known_url: str = None,
+    condition: str = None,
 ) -> dict:
     """
     Fetch CardMarket prices for any One Piece product.
 
-    known_url: previously cached CM product URL — tried first, skips slug/search.
+    known_url:  previously cached CM product URL — tried first, skips slug/search.
+    condition:  item condition (M/NM/LP/MP/HP/PL) — injects minCondition into URL
+                so prices reflect listings at that condition or better.
     Returns: {trend, low, market, url, error}
     """
     result: dict = {
@@ -689,17 +692,19 @@ def get_card_prices(
 
     _is_lang_filtered = language is not None
 
-    # Normalise cached URL: strip condition filters, ensure correct language param.
-    # minCondition=1 returns Mint-only listings → inflated "low".
-    # language= param makes info-box trend/from/market language-specific.
+    # Normalise cached URL: strip stale condition/language params, re-inject correct ones.
+    # minCondition=1 returns Mint-only listings → inflated "low" for NM/LP cards.
     if known_url:
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
         from optcg.scrapers.slugs import LANGUAGE_CM_CODES as _LANG_CODES
+        from optcg.scrapers.slugs import CONDITION_CM_CODES as _COND_CODES
         _p  = urlparse(known_url)
         _qs = {k: v for k, v in parse_qs(_p.query).items()
                if k.lower() not in ("mincondition", "maxcondition", "language")}
         if language and language.upper() in _LANG_CODES:
             _qs["language"] = [str(_LANG_CODES[language.upper()])]
+        if condition and condition.upper() in _COND_CODES:
+            _qs["minCondition"] = [str(_COND_CODES[condition.upper()])]
         known_url = urlunparse(_p._replace(query=urlencode(_qs, doseq=True)))
 
     # ── Known URL (cached from previous successful fetch) ─────────────────────

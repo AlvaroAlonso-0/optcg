@@ -50,6 +50,19 @@ SET_SLUGS: dict[str, str] = {
     "ST-20": "ONE-PIECE-CARD-GAME-Black-Gecko-Moria",
 }
 
+# ── CardMarket condition codes ────────────────────────────────────────────────
+# Used as ?minCondition=N — shows listings at this condition OR BETTER.
+# CardMarket: 1=Mint, 2=NM, 3=Excellent, 4=Good, 5=Light Played, 6=Played, 7=Poor
+
+CONDITION_CM_CODES: dict[str, int] = {
+    "M":  1,   # Mint
+    "NM": 2,   # Near Mint
+    "LP": 3,   # Light Played  → CM "Excellent"
+    "MP": 4,   # Moderately Played → CM "Good"
+    "HP": 5,   # Heavily Played → CM "Light Played"
+    "PL": 6,   # Poor / Played → CM "Played"
+}
+
 # ── CardMarket language codes ─────────────────────────────────────────────────
 # https://www.cardmarket.com/en/Magic/Help/LanguageCodes (same across games)
 
