@@ -8,11 +8,46 @@ Without JS (Quick Look): all sections scroll vertically.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
 
 from optcg.db import Database
+
+# ── Image cache ───────────────────────────────────────────────────────────────
+_IMG_CACHE_DIR = Path.home() / ".config" / "optcg" / "img_cache"
+
+
+def _fetch_img_b64(url: str) -> str | None:
+    """Fetch a CardMarket image URL and return a base64 data URI (file-cached).
+
+    CM product images on S3 require Referer: cardmarket.com — browsers
+    opening a file:// page send no Referer and get 403. Embedding as a data
+    URI makes the dashboard self-contained.
+    """
+    if not url:
+        return None
+    _IMG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = _IMG_CACHE_DIR / (hashlib.sha1(url.encode()).hexdigest() + ".b64")
+    if cache_file.exists():
+        return cache_file.read_text()
+    try:
+        from optcg.scrapers.cardmarket import _make_session
+        r = _make_session().get(
+            url,
+            headers={"Referer": "https://www.cardmarket.com/"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        mime = "image/png" if url.lower().endswith(".png") else "image/jpeg"
+        data_uri = f"data:{mime};base64,{base64.b64encode(r.content).decode()}"
+        cache_file.write_text(data_uri)
+        return data_uri
+    except Exception:
+        return None
 from optcg.portfolio import item_pnl, portfolio_summary
 from optcg.config import EXPORTS_DIR
 
@@ -201,7 +236,9 @@ def _build(db: Database) -> dict:
             "sell_price":    item["sell_price"] if "sell_price" in item.keys() else None,
             "sell_date":     item["sell_date"]  if "sell_date"  in item.keys() else None,
             "sell_source":   item["sell_source"] if "sell_source" in item.keys() else None,
-            "cardmarket_img": item["cardmarket_img"] if "cardmarket_img" in item.keys() else None,
+            "cardmarket_img": _fetch_img_b64(
+                item["cardmarket_img"] if "cardmarket_img" in item.keys() else None
+            ),
         })
 
     # Timeline

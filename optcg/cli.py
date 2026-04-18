@@ -1,6 +1,7 @@
 """
 optcg — One Piece TCG Investment Tracker
 """
+import os
 import re
 import subprocess
 import sys
@@ -25,6 +26,18 @@ from optcg.search import (
 )
 
 console = Console()
+
+
+def _open_path(path: Path) -> None:
+    """Open a file or directory with the OS default application (cross-platform)."""
+    import platform
+    sys = platform.system()
+    if sys == "Darwin":
+        subprocess.run(["open", str(path)], check=False)
+    elif sys == "Windows":
+        os.startfile(str(path))
+    else:
+        subprocess.run(["xdg-open", str(path)], check=False)
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
@@ -292,10 +305,40 @@ def add_card(name, set_code, card_number, lang, condition, foil, variant,
     """
     # ── Interactive card search ────────────────────────────────────────────────
     if not name:
+        import questionary as _q
         query = click.prompt("Search CardMarket")
         result = pick_card(query, language=lang)
         if not result:
             console.print("[yellow]Cancelled.[/yellow]")
+            return
+        dest = _q.select(
+            "Add to:",
+            choices=[
+                _q.Choice("Portfolio  (bought it)", value="portfolio"),
+                _q.Choice("Wishlist   (want it)",   value="wishlist"),
+                _q.Choice("Cancel",                 value=None),
+            ],
+        ).ask()
+        if not dest:
+            return
+        if dest == "wishlist":
+            sc = set_code
+            if not sc and result.card_number:
+                m = re.match(r"([A-Z]+)(\d+)-", result.card_number)
+                if m:
+                    sc = f"{m.group(1)}-{m.group(2)}"
+            target_raw = click.prompt("Target price € (leave blank to skip)", default="", show_default=False)
+            try:    target_price = float(target_raw) if target_raw.strip() else None
+            except: target_price = None
+            with db_conn() as conn:
+                db_obj = Database(conn)
+                wid = db_obj.lastrowid(
+                    "INSERT INTO watchlist (name, set_code, card_number, variant, language, item_type, target_price, cm_url) VALUES (?,?,?,?,?,?,?,?)",
+                    (result.name, sc, result.card_number, result.variant or None,
+                     lang or "EN", "card", target_price, result.cm_url),
+                )
+            vstr = f"  [magenta]{result.variant}[/magenta]" if result.variant else ""
+            console.print(f"[green]✓[/green] Added to wishlist [bold]#{wid}[/bold]: {result.name}{vstr}")
             return
         name        = name        or result.name
         card_number = card_number or result.card_number
@@ -354,10 +397,36 @@ def add_promo(name, card_number, set_code, variant, lang, condition, graded,
       optcg add promo -n "Monkey D. Luffy" --card-num ST21-014 --set P --variant V1 -l JP -c M -p 82.35
     """
     if not name:
+        import questionary as _q
         query = click.prompt("Search CardMarket")
         result = pick_card(query, language=lang)
         if not result:
             console.print("[yellow]Cancelled.[/yellow]")
+            return
+        dest = _q.select(
+            "Add to:",
+            choices=[
+                _q.Choice("Portfolio  (bought it)", value="portfolio"),
+                _q.Choice("Wishlist   (want it)",   value="wishlist"),
+                _q.Choice("Cancel",                 value=None),
+            ],
+        ).ask()
+        if not dest:
+            return
+        if dest == "wishlist":
+            sc = set_code or ("P" if (result.card_number or "").startswith("P-") else None)
+            target_raw = click.prompt("Target price € (leave blank to skip)", default="", show_default=False)
+            try:    target_price = float(target_raw) if target_raw.strip() else None
+            except: target_price = None
+            with db_conn() as conn:
+                db_obj = Database(conn)
+                wid = db_obj.lastrowid(
+                    "INSERT INTO watchlist (name, set_code, card_number, variant, language, item_type, target_price, cm_url) VALUES (?,?,?,?,?,?,?,?)",
+                    (result.name, sc, result.card_number, result.variant or None,
+                     lang or "EN", "promo", target_price, result.cm_url),
+                )
+            vstr = f"  [magenta]{result.variant}[/magenta]" if result.variant else ""
+            console.print(f"[green]✓[/green] Added to wishlist [bold]#{wid}[/bold]: {result.name}{vstr}")
             return
         name        = name        or result.name
         card_number = card_number or result.card_number
@@ -592,6 +661,123 @@ def list_items(item_type, set_code, lang, graded_only, pending_only, sold_only, 
 _SORT_CHOICE_SEARCH = click.Choice(list(SORT_OPTIONS.keys()), case_sensitive=False)
 
 
+def _set_code_from_result(card_number: str, set_slug: str) -> str:
+    """Derive a set code from card_number (OP12-020 → OP-12) or fall back to 'P'."""
+    import re as _re
+    m = _re.match(r'^([A-Za-z]+)(\d+)-', card_number or "")
+    if m:
+        return f"{m.group(1).upper()}-{m.group(2)}"
+    if (card_number or "").startswith("P-"):
+        return "P"
+    return "P"
+
+
+def _item_type_from_slug(set_slug: str) -> str:
+    """Guess item_type from CM set slug."""
+    slug_lower = set_slug.lower()
+    if "promo" in slug_lower or "tournament" in slug_lower:
+        return "promo"
+    return "card"
+
+
+def _add_from_result(r, lang: str) -> None:
+    """Prompt for destination (portfolio or wishlist), then insert from a CardResult."""
+    import questionary
+    from optcg.scrapers.slugs import LANGUAGE_CM_CODES
+
+    item_type = _item_type_from_slug(r.set_slug)
+    set_code  = _set_code_from_result(r.card_number, r.set_slug)
+
+    cm_url = r.cm_url
+    if lang:
+        lcode = LANGUAGE_CM_CODES.get(lang.upper())
+        if lcode and "language=" not in cm_url:
+            sep = "&" if "?" in cm_url else "?"
+            cm_url += f"{sep}language={lcode}"
+
+    console.print(
+        f"\n[bold]{r.name}[/bold]  [cyan]{r.card_number}[/cyan]"
+        f"  [magenta]{r.variant}[/magenta]  [dim]{r.set_slug}[/dim]"
+        f"\n[dim]Type: {item_type}  Set: {set_code}[/dim]\n"
+    )
+
+    dest = questionary.select(
+        "Add to:",
+        choices=[
+            questionary.Choice("Portfolio  (bought it)", value="portfolio"),
+            questionary.Choice("Wishlist   (want it)",   value="wishlist"),
+            questionary.Choice("Cancel",                 value=None),
+        ],
+    ).ask()
+
+    if not dest:
+        return
+
+    # ── Wishlist path ─────────────────────────────────────────────────────────
+    if dest == "wishlist":
+        target_raw = click.prompt("Target price € (leave blank to skip)", default="", show_default=False)
+        try:
+            target_price = float(target_raw) if target_raw.strip() else None
+        except ValueError:
+            target_price = None
+        pick_lang = click.prompt("Language", default=lang or "EN").upper()
+        with db_conn() as conn:
+            db_obj = Database(conn)
+            row_id = db_obj.lastrowid(
+                "INSERT INTO watchlist (name, set_code, card_number, variant, language, item_type, target_price, cm_url) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (r.name, set_code, r.card_number, r.variant or None, pick_lang,
+                 item_type, target_price, cm_url),
+            )
+        vstr = f"  [magenta]{r.variant}[/magenta]" if r.variant else ""
+        console.print(f"[green]✓[/green] Added to wishlist [bold]#{row_id}[/bold]: {r.name}{vstr}")
+        return
+
+    # ── Portfolio path ────────────────────────────────────────────────────────
+    price     = click.prompt("Purchase price (EUR)", type=float)
+    pick_lang = click.prompt("Language", default=lang or "EN").upper()
+    condition = click.prompt("Condition [M/NM/LP/MP/HP/PL]", default="NM").upper()
+    source    = click.prompt("Source", default="CardMarket")
+
+    item_id = _insert_item(
+        item_type=item_type, name=r.name, set_code=set_code,
+        card_number=r.card_number, language=pick_lang, condition=condition,
+        foil=False, variant=r.variant or None, graded=False,
+        grading_company=None, grade=None, cert_number=None,
+        price=price, purchase_date=str(date.today()), source=source, notes=None,
+    )
+
+    # Cache CM URL
+    from optcg.config import DB_PATH
+    import sqlite3 as _sqlite3
+    _c = _sqlite3.connect(str(DB_PATH))
+    _c.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?", (cm_url, item_id))
+    _c.commit(); _c.close()
+
+    console.print(f"[green]✓[/green] Added {item_type} [bold]#{item_id}[/bold]: {r.name}")
+    _auto_update(item_id)
+
+
+def _print_search_table(results, page: int, sort: str) -> None:
+    from rich.table import Table
+    from rich import box as rbox
+    t = Table(box=rbox.SIMPLE, show_header=True, header_style="bold cyan", pad_edge=False)
+    t.add_column("#",      style="dim",        width=3,  no_wrap=True)
+    t.add_column("Name",   style="bold white", min_width=26)
+    t.add_column("Number", style="cyan",       width=13, no_wrap=True)
+    t.add_column("Set",    style="dim",        min_width=16)
+    t.add_column("Var",    style="magenta",    width=5,  no_wrap=True)
+    t.add_column("From",   style="green",      width=10, no_wrap=True)
+    for i, r in enumerate(results, 1):
+        set_display = r.set_slug.replace("-", " ").replace("ONE PIECE CARD GAME ", "")[:28]
+        t.add_row(str(i), r.name[:36], r.card_number, set_display, r.variant, r.price_from)
+    console.print(t)
+    console.print(
+        f"[dim]{len(results)} result(s) · page {page} · sorted by {sort}"
+        f"  |  n next · p prev · # image · add # pick · q quit[/dim]"
+    )
+
+
 @main.command("search")
 @click.argument("query")
 @click.option("--lang",  "-l", default=None,       type=_LANG_CHOICE, help="Filter by language")
@@ -599,68 +785,111 @@ _SORT_CHOICE_SEARCH = click.Choice(list(SORT_OPTIONS.keys()), case_sensitive=Fal
               help="popular | cheap | expensive | name | number | new | old")
 @click.option("--page",  "-p", default=1,          type=int, show_default=True, help="Page number")
 @click.option("--image", "-i", is_flag=True,       default=False,
-              help="Prompt to show a card image inline (WezTerm/iTerm2/Kitty)")
-def search_cmd(query: str, lang: str, sort: str, page: int, image: bool):
+              help="Interactive browse: view images, navigate pages, add to collection")
+@click.option("--pick",  "-k", default=None,       type=int,
+              help="Pick result #N directly and add it to your collection")
+def search_cmd(query: str, lang: str, sort: str, page: int, image: bool, pick: int):
     """Search CardMarket for One Piece singles.
 
     \b
     Sort options: popular, cheap, expensive, name, number, new, old
     Examples:
       optcg search "Luffy" --sort cheap --page 2
-      optcg search "Zoro" --sort new --image
+      optcg search "Zoro" --sort expensive --pick 23
+      optcg search "Zoro" --image          # browse, view images, add interactively
     """
-    from rich.table import Table
-    from rich import box as rbox
-
-    with console.status(
-        f"[dim]Searching [bold]{query}[/bold]  [page {page}, sort: {sort}]…"
-    ):
+    # ── Initial fetch ─────────────────────────────────────────────────────────
+    with console.status(f"[dim]Searching [bold]{query}[/bold]  [page {page}, sort: {sort}]…"):
         results = search_cardmarket(query, language=lang, sort=sort, page=page)
 
     if not results:
         console.print("[yellow]No results.[/yellow]")
         return
 
-    t = Table(box=rbox.SIMPLE, show_header=True, header_style="bold cyan",
-              pad_edge=False)
-    t.add_column("#",      style="dim",        width=3,  no_wrap=True)
-    t.add_column("Name",   style="bold white", min_width=26)
-    t.add_column("Number", style="cyan",       width=13, no_wrap=True)
-    t.add_column("Set",    style="dim",        min_width=16)
-    t.add_column("Var",    style="magenta",    width=5,  no_wrap=True)
-    t.add_column("From",   style="green",      width=10, no_wrap=True)
+    _print_search_table(results, page, sort)
 
-    for i, r in enumerate(results, 1):
-        set_display = (
-            r.set_slug.replace("-", " ")
-            .replace("ONE PIECE CARD GAME ", "")
-            [:28]
-        )
-        t.add_row(str(i), r.name[:36], r.card_number,
-                  set_display, r.variant, r.price_from)
+    # ── Non-interactive --pick shortcut ───────────────────────────────────────
+    if pick is not None:
+        if not (1 <= pick <= len(results)):
+            console.print(f"[red]--pick {pick} out of range (1–{len(results)})[/red]")
+            return
+        _add_from_result(results[pick - 1], lang)
+        return
 
-    console.print(t)
+    # ── Interactive image-browse mode ─────────────────────────────────────────
+    if not image:
+        return
+
+    if not _supports_inline_images():
+        console.print("[yellow]Inline images not supported in this terminal.[/yellow]")
+        return
+
+    from optcg.search import fetch_card_image_bytes, _iterm2_inline, _write_to_tty
+
     console.print(
-        f"[dim]{len(results)} result(s) · page {page} · sorted by {sort}"
-        f"  |  --page {page+1} for more, --sort [popular|cheap|expensive|name|number|new|old][/dim]"
+        "[dim]Commands:  [bold]#[/bold] view image  "
+        "·  [bold]add #[/bold] add to collection  "
+        "·  [bold]n[/bold] next page  "
+        "·  [bold]p[/bold] prev page  "
+        "·  [bold]q[/bold] quit[/dim]"
     )
 
-    if image:
-        if not _supports_inline_images():
-            console.print("[yellow]Inline images not supported in this terminal.[/yellow]")
-            return
-        idx_str = click.prompt("Show image for # (or Enter to skip)", default="")
-        if idx_str.strip().isdigit():
-            idx = int(idx_str.strip()) - 1
+    while True:
+        cmd = click.prompt(f"[page {page}]", default="q", prompt_suffix=" > ").strip().lower()
+
+        if cmd in ("q", ""):
+            break
+
+        elif cmd == "n":
+            page += 1
+            with console.status(f"[dim]Loading page {page}…"):
+                new_results = search_cardmarket(query, language=lang, sort=sort, page=page)
+            if not new_results:
+                console.print("[yellow]No more results.[/yellow]")
+                page -= 1
+            else:
+                results = new_results
+                _print_search_table(results, page, sort)
+
+        elif cmd == "p":
+            if page <= 1:
+                console.print("[dim]Already on page 1.[/dim]")
+            else:
+                page -= 1
+                with console.status(f"[dim]Loading page {page}…"):
+                    results = search_cardmarket(query, language=lang, sort=sort, page=page)
+                _print_search_table(results, page, sort)
+
+        elif cmd.startswith("add "):
+            parts = cmd.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                idx = int(parts[1]) - 1
+                if 0 <= idx < len(results):
+                    _add_from_result(results[idx], lang)
+                else:
+                    console.print(f"[red]#{idx+1} out of range (1–{len(results)})[/red]")
+            else:
+                console.print("[dim]Usage: add <number>[/dim]")
+
+        elif cmd.isdigit():
+            idx = int(cmd) - 1
             if 0 <= idx < len(results):
-                from optcg.search import fetch_card_image_bytes, _iterm2_inline, _write_to_tty
                 with console.status("[dim]Loading image…"):
                     img_data = fetch_card_image_bytes(results[idx])
-                # Write image AFTER status exits — avoids escape seq mangling
+                r = results[idx]
+                console.print(
+                    f"[bold]{r.name}[/bold]  [cyan]{r.card_number}[/cyan]"
+                    f"  [magenta]{r.variant}[/magenta]  [green]{r.price_from}[/green]"
+                )
                 if img_data:
                     _write_to_tty(_iterm2_inline(img_data, width_cols=30))
                 else:
-                    console.print(f"[dim]{results[idx].image_url}[/dim]")
+                    console.print(f"[dim]No image available.[/dim]")
+            else:
+                console.print(f"[red]#{int(cmd)} out of range (1–{len(results)})[/red]")
+
+        else:
+            console.print("[dim]Unknown command. Try: # · add # · n · p · q[/dim]")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -992,7 +1221,7 @@ def receipt_open(item_id, receipt_id):
     if not row:
         console.print("[red]Receipt not found.[/red]"); sys.exit(1)
     path = RECEIPTS_DIR / row["filename"]
-    subprocess.run(["open", str(path)], check=False)
+    _open_path(path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1475,11 +1704,12 @@ def watchlist():
 @click.option("--name",     "-n", required=True)
 @click.option("--set",      "-s", "set_code",   default=None)
 @click.option("--card-num",       "card_number", default=None)
+@click.option("--variant",  "-v", default=None, help="e.g. V.3, Alt Art")
 @click.option("--lang",     "-l", default=None,  type=_LANG_CHOICE)
 @click.option("--target",         "target_price", type=float, default=None,
               help="Alert if price drops below this")
 @click.option("--notes",          default=None)
-def watchlist_add(name, set_code, card_number, lang, target_price, notes):
+def watchlist_add(name, set_code, card_number, variant, lang, target_price, notes):
     """Add a card to your watchlist.
 
     \b
@@ -1487,15 +1717,17 @@ def watchlist_add(name, set_code, card_number, lang, target_price, notes):
       optcg watchlist add -n "Shanks" -s OP-01 --target 80.00
       optcg watchlist add -n "Kaido" --card-num OP01-060 -l JP
       optcg watchlist add -n "Big Mom" --target 25.00 --notes "want NM or better"
+      optcg watchlist add -n "Luffy" --card-num OP01-001 --variant V.3 --target 200
     """
     with db_conn() as conn:
         db = Database(conn)
         row_id = db.lastrowid(
-            "INSERT INTO watchlist (name, set_code, card_number, language, target_price, notes) "
-            "VALUES (?,?,?,?,?,?)",
-            (name, set_code, card_number, lang, target_price, notes),
+            "INSERT INTO watchlist (name, set_code, card_number, variant, language, target_price, notes) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (name, set_code, card_number, variant, lang, target_price, notes),
         )
-    console.print(f"[green]✓[/green] Watchlist #{row_id}: {name}")
+    vstr = f"  {variant}" if variant else ""
+    console.print(f"[green]✓[/green] Watchlist #{row_id}: {name}{vstr}")
 
 
 @watchlist.command("list")
@@ -1507,11 +1739,12 @@ def watchlist_list():
     if not rows:
         console.print("[dim]Watchlist empty. Add with: optcg watchlist add --name '...'[/dim]")
         return
-    tbl = Table("#", "Name", "Set", "Card #", "Lang", "Target €", "Notes",
+    tbl = Table("#", "Name", "Variant", "Set", "Card #", "Lang", "Target €", "Notes",
                 box=box.ROUNDED, header_style="bold cyan")
     for r in rows:
         tbl.add_row(
-            str(r["id"]), r["name"], r["set_code"] or "—", r["card_number"] or "—",
+            str(r["id"]), r["name"], r.get("variant") or "—",
+            r["set_code"] or "—", r["card_number"] or "—",
             r["language"] or "—",
             f"{r['target_price']:.2f}" if r["target_price"] else "—",
             r["notes"] or "—",
@@ -1552,10 +1785,15 @@ def watchlist_check(discount):
         return
 
     for row in rows:
-        console.print(f"\n[bold cyan]{row['name']}[/bold cyan]"
+        vstr = f"  [magenta]{row['variant']}[/magenta]" if row["variant"] else ""
+        console.print(f"\n[bold cyan]{row['name']}[/bold cyan]{vstr}"
                       f"  [dim]{row['set_code'] or ''} {row['card_number'] or ''}[/dim]")
         with console.status("Fetching…"):
-            cm = get_card_prices(row["name"], row["set_code"], row["card_number"], row["language"])
+            cm = get_card_prices(
+                row["name"], row["set_code"], row["card_number"],
+                row["language"], row["item_type"] or "card",
+                known_url=row["cm_url"],
+            )
 
         market = cm.get("trend")
         target = row["target_price"]
@@ -1754,6 +1992,28 @@ def db_stats():
 # DASHBOARD (static HTML export)
 # ══════════════════════════════════════════════════════════════════════════════
 
+@main.command("tui")
+def tui_cmd():
+    """Interactive TUI dashboard (lazygit-style).
+
+    \b
+    Keys:
+      ↑↓       navigate portfolio
+      f        cycle type filter (all / singles / promos / boxes …)
+      s        cycle sort (P&L € / P&L % / paid / date / name)
+      u        update price for selected item
+      r        reload all data
+      1        focus portfolio panel
+      2        focus detail panel
+      3        focus P&L chart
+      typing   live search (backspace to delete)
+      Escape   clear search
+      q        quit
+    """
+    from optcg.tui import run_tui
+    run_tui()
+
+
 @main.command("dashboard")
 @click.option("--out", default=None, type=click.Path(path_type=Path),
               help="Custom output path (default: iCloud exports/dashboard.html)")
@@ -1772,7 +2032,7 @@ def dashboard_cmd(out):
         db = Database(conn)
         path = generate_html(db, Path(out) if out else None)
     console.print(f"[green]✓[/green] Dashboard: {path}")
-    subprocess.Popen(["open", str(path)])
+    _open_path(path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2030,22 +2290,46 @@ def dash_cmd():
             console.print(line)
 
     # ── P&L bar chart (text) ──────────────────────────────────────────────────
-    priced = [(item["name"], p["pnl"]) for item, p in rows if p["pnl"] is not None]
+    priced = [(item, p["pnl"]) for item, p in rows if p["pnl"] is not None]
     if priced:
         console.print()
         console.rule("[dim]P&L per item[/dim]")
         max_abs = max(abs(v) for _, v in priced) or 1
-        BAR = 28
-        for name, v in sorted(priced, key=lambda x: -x[1]):
+        BAR = 20
+        for item, v in sorted(priced, key=lambda x: -x[1]):
             blen = int(abs(v) / max_abs * BAR)
+            pad  = " " * (BAR - blen)   # pad after bar so value column aligns
             if v >= 0:
-                bar  = f"[green]{'█' * blen}[/green]"
+                bar  = f"[green]{'█' * blen}[/green]{pad}"
                 val  = f"[green]+{v:.2f} €[/green]"
             else:
-                bar  = f"[red]{'█' * blen}[/red]"
+                bar  = f"[red]{'█' * blen}[/red]{pad}"
                 val  = f"[red]{v:.2f} €[/red]"
-            label = name[:26].ljust(26)
-            console.print(f"  [dim]{label}[/dim]  {bar:<30}  {val}")
+            # Build disambiguating sub-label: set+card_number, language, condition
+            sub_parts = []
+            sc = item["set_code"] or ""
+            cn = item["card_number"] or ""
+            if sc and cn:
+                sub_parts.append(f"{sc}-{cn}")
+            elif sc:
+                sub_parts.append(sc)
+            if item["language"] and item["language"] != "EN":
+                sub_parts.append(item["language"])
+            if item["condition"] and item["item_type"] in ("card", "promo"):
+                sub_parts.append(item["condition"])
+            if item["variant"]:
+                sub_parts.append(item["variant"])
+            sub_plain = ("  " + " · ".join(sub_parts)) if sub_parts else ""
+            sub_rich  = ("  [dim]" + " · ".join(sub_parts) + "[/dim]") if sub_parts else ""
+            # Measure plain visible width and pad to fixed column so bars align
+            LABEL_W  = 44
+            id_prefix = f"#{item['id']} "         # e.g. "#19 "
+            name_max  = LABEL_W - len(id_prefix) - len(sub_plain)
+            name_part = item["name"][:max(8, name_max)]
+            plain_label = f"{id_prefix}{name_part}{sub_plain}"
+            pad = " " * max(0, LABEL_W - len(plain_label))
+            rich_label  = f"[bold]{id_prefix}[/bold]{name_part}{sub_rich}"
+            console.print(f"  {rich_label}{pad}  {bar}  {val}")
 
     console.rule()
 

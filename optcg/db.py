@@ -85,6 +85,14 @@ MIGRATIONS = [
     (8, """
     ALTER TABLE items ADD COLUMN cardmarket_img TEXT
     """),
+    (9, """
+    ALTER TABLE watchlist ADD COLUMN variant TEXT;
+    ALTER TABLE watchlist ADD COLUMN item_type TEXT DEFAULT 'card';
+    ALTER TABLE watchlist ADD COLUMN cm_url TEXT
+    """),
+    (10, """
+    ALTER TABLE watchlist ADD COLUMN cardmarket_img TEXT
+    """),
 ]
 
 

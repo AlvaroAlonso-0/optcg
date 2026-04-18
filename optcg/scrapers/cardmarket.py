@@ -3,34 +3,37 @@ CardMarket scraper for One Piece TCG prices.
 
 Cloudflare bypass strategy
 ──────────────────────────
-CardMarket uses Cloudflare Managed Challenge. Headless browsers are reliably
-detected and blocked regardless of stealth patches.
+CardMarket uses Cloudflare Managed Challenge. curl_cffi presents the same
+Chrome TLS fingerprint, so Cloudflare accepts cookies from a real browser.
 
-Practical solution: we auto-extract the cf_clearance cookie (and companion
-cookies) from the Arc browser profile on macOS. curl_cffi presents the same
-Chrome TLS fingerprint, so Cloudflare accepts the cookies.
+Cookies are auto-extracted from Arc or Chrome on both macOS and Windows.
 
-Auto-extraction requires:
-  • Arc browser installed (uses its Cookies SQLite DB)
-  • macOS Keychain entry "Arc Safe Storage" (created automatically by Arc)
-  • `cryptography` package (pip install cryptography)
+macOS (Arc / Chrome):
+  • AES-CBC, 16-byte key via PBKDF2(keychain_password, "saltysalt", 1003)
+  • Keychain services: "Arc Safe Storage", "Chrome Safe Storage"
+
+Windows (Arc / Chrome):
+  • AES-GCM, 32-byte key stored in browser's Local State, DPAPI-wrapped
+  • ctypes CryptUnprotectData — no extra packages needed
 
 Fallback — manual cookie entry:
-  1. Open cardmarket.com in Chrome/Arc (loads normally for real users)
+  1. Open cardmarket.com in Chrome/Arc
   2. DevTools → Application → Cookies → https://www.cardmarket.com
-  3. Copy the value of `cf_clearance`
-  4. Run: optcg config set-cookie <paste-value>
-
-The cookie typically lasts several days. Re-run when you get 403s again.
+  3. Copy value of cf_clearance
+  4. Run: optcg config set-cookie <value>
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import logging
+import os
+import platform
 import sqlite3
 import subprocess
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +51,8 @@ from optcg.config import CONFIG_FILE, CONFIG_DIR
 
 logger = logging.getLogger(__name__)
 
+_PLATFORM = platform.system()   # "Darwin" | "Windows" | "Linux"
+
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -64,23 +69,18 @@ _HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-# Cookies we care about from the Arc profile
 _CM_COOKIE_NAMES = {"cf_clearance", "__cf_bm", "_cfuvid", "PHPSESSID"}
+_KEY_TTL_DAYS    = 7
 
-# Module-level cache so Keychain is only prompted once per process
-_arc_key_cache: Optional[bytes] = None
+# Per-browser in-process key cache  {cache_key: bytes}
+_key_cache: dict[str, bytes] = {}
 
-# Persist derived key to disk; only re-ask Keychain after this many days
-_ARC_KEY_TTL_DAYS = 7
-
-# AppleScript: open URL in Arc without switching to it
+# AppleScript: open CardMarket in Arc without stealing focus (macOS only)
 _OPEN_BG_SCRIPT = """\
 tell application "Arc"
     open location "https://www.cardmarket.com/en/OnePiece"
 end tell
 """
-
-# AppleScript: close any tab whose URL contains cardmarket.com
 _CLOSE_CM_SCRIPT = """\
 tell application "Arc"
     repeat with w in every window
@@ -117,12 +117,10 @@ def _save_config(data: dict) -> None:
 
 
 def get_cf_cookie() -> Optional[str]:
-    """Return the stored cf_clearance cookie value, or None if not set."""
     return _load_config().get("cf_clearance")
 
 
 def set_cf_cookie(value: str) -> None:
-    """Persist the cf_clearance cookie value."""
     data = _load_config()
     data["cf_clearance"] = value.strip()
     data["cf_clearance_saved"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -136,116 +134,210 @@ def clear_cf_cookie() -> None:
     _save_config(data)
 
 
-# ── Arc browser cookie auto-extraction ────────────────────────────────────────
+# ── macOS: AES-CBC cookie decryption ─────────────────────────────────────────
 
-def _arc_decrypt_value(enc: bytes, key: bytes) -> Optional[str]:
-    """
-    Decrypt a Chromium AES-CBC cookie value.
-
-    Format: b'v10' (3 bytes) | IV (16 bytes) | ciphertext
-    The decrypted plaintext has an internal 16-byte prefix before the actual
-    value (Chromium prepends it for versioning), followed by PKCS#7 padding.
+def _macos_decrypt_value(enc: bytes, key: bytes) -> Optional[str]:
+    """Decrypt Chromium AES-CBC cookie (macOS).
+    Format: b'v10' | IV(16) | ciphertext; plaintext has 16-byte internal prefix.
     """
     if not enc.startswith(b"v10"):
-        # Unencrypted (plain text) — rare for CF cookies but handle it
         try:
             return enc.decode("utf-8")
         except Exception:
             return None
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-        iv = enc[3:19]
-        ct = enc[19:]
-        decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
-        raw = decryptor.update(ct) + decryptor.finalize()
-        pad_len = raw[-1]
-        # Skip Chromium's 16-byte internal prefix, strip PKCS#7 padding
-        value = raw[16:-pad_len].decode("utf-8")
-        return value
+        iv  = enc[3:19]
+        ct  = enc[19:]
+        dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        raw = dec.update(ct) + dec.finalize()
+        pad = raw[-1]
+        return raw[16:-pad].decode("utf-8")
     except Exception as exc:
-        logger.debug("Arc cookie decrypt error: %s", exc)
+        logger.debug("macOS cookie decrypt error: %s", exc)
         return None
 
 
-def _arc_master_key() -> Optional[bytes]:
-    """
-    Retrieve Arc's AES master key.
-
-    Cache hierarchy:
-      1. Module-level (_arc_key_cache)   — free, per-process
-      2. Config file (arc_key_b64)       — free, survives for _ARC_KEY_TTL_DAYS
-      3. macOS Keychain                  — prompts user, at most once per week
+def _macos_master_key(keychain_service: str, cache_key: str) -> Optional[bytes]:
+    """Retrieve Chromium AES master key from macOS Keychain.
+    Cache hierarchy: in-process dict → config file (7 days) → Keychain.
     """
     import base64
-    from datetime import datetime, timedelta
 
-    global _arc_key_cache
-    if _arc_key_cache is not None:
-        return _arc_key_cache
+    if cache_key in _key_cache:
+        return _key_cache[cache_key]
 
-    # ── Level 2: file cache ───────────────────────────────────────────────────
-    cfg = _load_config()
-    b64 = cfg.get("arc_key_b64")
-    saved_at = cfg.get("arc_key_cached_at")
+    cfg      = _load_config()
+    b64_key  = f"{cache_key}_key_b64"
+    b64_at   = f"{cache_key}_key_cached_at"
+    b64      = cfg.get(b64_key)
+    saved_at = cfg.get(b64_at)
     if b64 and saved_at:
         try:
             age = datetime.now() - datetime.fromisoformat(saved_at)
-            if age < timedelta(days=_ARC_KEY_TTL_DAYS):
-                _arc_key_cache = base64.b64decode(b64)
-                logger.debug("Arc key loaded from file cache (age %s)", age)
-                return _arc_key_cache
+            if age < timedelta(days=_KEY_TTL_DAYS):
+                _key_cache[cache_key] = base64.b64decode(b64)
+                return _key_cache[cache_key]
         except Exception:
-            pass  # corrupt entry — fall through to Keychain
+            pass
 
-    # ── Level 3: Keychain ─────────────────────────────────────────────────────
     try:
         master = subprocess.check_output(
-            ["security", "find-generic-password", "-w", "-s", "Arc Safe Storage"],
-            stderr=subprocess.DEVNULL,
-            timeout=15,
+            ["security", "find-generic-password", "-w", "-s", keychain_service],
+            stderr=subprocess.DEVNULL, timeout=15,
         ).strip()
         key = hashlib.pbkdf2_hmac("sha1", master, b"saltysalt", 1003, 16)
-        _arc_key_cache = key
-
-        # Persist so the next 7 days of runs skip Keychain entirely
-        cfg["arc_key_b64"] = base64.b64encode(key).decode()
-        cfg["arc_key_cached_at"] = datetime.now().isoformat()
+        _key_cache[cache_key] = key
+        cfg[b64_key] = base64.b64encode(key).decode()
+        cfg[b64_at]  = datetime.now().isoformat()
         _save_config(cfg)
-        logger.debug("Arc key fetched from Keychain and cached to disk")
-
+        logger.debug("Key fetched from Keychain: %s", keychain_service)
         return key
     except Exception as exc:
-        logger.debug("Arc Keychain lookup failed: %s", exc)
+        logger.debug("Keychain lookup failed (%s): %s", keychain_service, exc)
         return None
 
 
-def _arc_cookie_db() -> Optional[Path]:
-    """Return path to Arc's Cookies SQLite file, or None if not found."""
-    candidate = (
-        Path.home()
-        / "Library"
-        / "Application Support"
-        / "Arc"
-        / "User Data"
-        / "Default"
-        / "Cookies"
+# ── Windows: DPAPI + AES-GCM cookie decryption ───────────────────────────────
+
+def _dpapi_decrypt(data: bytes) -> bytes:
+    """Decrypt bytes with Windows CryptUnprotectData (no extra packages)."""
+    import ctypes
+    import ctypes.wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf    = ctypes.create_string_buffer(data, len(data))
+    blob_in  = DATA_BLOB(len(data), buf)
+    blob_out = DATA_BLOB()
+    ok = ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
     )
-    return candidate if candidate.exists() else None
+    if not ok:
+        raise RuntimeError(f"CryptUnprotectData failed: {ctypes.GetLastError()}")
+    result = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return result
 
 
-def _read_arc_cookies_from_db() -> dict[str, str]:
-    """Low-level: read and decrypt CardMarket cookies from Arc's SQLite DB."""
-    db_path = _arc_cookie_db()
-    if not db_path:
-        return {}
-    key = _arc_master_key()
-    if not key:
-        return {}
+def _windows_browser_key(local_state_path: Path, cache_key: str) -> Optional[bytes]:
+    """Extract AES-GCM key from Windows browser Local State (DPAPI-wrapped)."""
+    import base64
+
+    if cache_key in _key_cache:
+        return _key_cache[cache_key]
+    try:
+        state   = json.loads(local_state_path.read_text(encoding="utf-8"))
+        enc_key = base64.b64decode(state["os_crypt"]["encrypted_key"])[5:]  # strip b"DPAPI"
+        key     = _dpapi_decrypt(enc_key)
+        _key_cache[cache_key] = key
+        return key
+    except Exception as exc:
+        logger.debug("Windows browser key extract failed (%s): %s", cache_key, exc)
+        return None
+
+
+def _windows_decrypt_value(enc: bytes, key: bytes) -> Optional[str]:
+    """Decrypt Chromium AES-GCM cookie (Windows).
+    v10/v20: b'v10'|nonce(12)|ciphertext+tag(16).
+    Legacy: raw DPAPI blob.
+    """
+    if enc[:3] in (b"v10", b"v20"):
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            nonce = enc[3:15]
+            ct    = enc[15:]
+            return AESGCM(key).decrypt(nonce, ct, None).decode("utf-8")
+        except Exception as exc:
+            logger.debug("AES-GCM decrypt failed: %s", exc)
+            return None
+    else:
+        try:
+            return _dpapi_decrypt(enc).decode("utf-8")
+        except Exception:
+            return None
+
+
+# ── Browser profile discovery ─────────────────────────────────────────────────
+
+def _macos_browsers() -> list[tuple[str, Path, str]]:
+    """Return [(browser_name, cookie_db_path, keychain_service)] available on macOS."""
+    home = Path.home()
+    candidates = [
+        ("arc",    home / "Library/Application Support/Arc/User Data/Default/Cookies",
+                   "Arc Safe Storage"),
+        ("chrome", home / "Library/Application Support/Google/Chrome/Default/Cookies",
+                   "Chrome Safe Storage"),
+        ("brave",  home / "Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies",
+                   "Brave Browser"),
+        ("edge",   home / "Library/Application Support/Microsoft Edge/Default/Cookies",
+                   "Microsoft Edge"),
+    ]
+    return [(name, p, svc) for name, p, svc in candidates if p.exists()]
+
+
+def _windows_browsers() -> list[tuple[str, Path, Path]]:
+    """Return [(browser_name, cookie_db_path, local_state_path)] available on Windows."""
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    results: list[tuple[str, Path, Path]] = []
+
+    candidates: list[tuple[str, str, str]] = [
+        ("chrome",
+         str(local / "Google/Chrome/User Data/Default/Network/Cookies"),
+         str(local / "Google/Chrome/User Data/Local State")),
+        ("edge",
+         str(local / "Microsoft/Edge/User Data/Default/Network/Cookies"),
+         str(local / "Microsoft/Edge/User Data/Local State")),
+        ("brave",
+         str(local / "BraveSoftware/Brave-Browser/User Data/Default/Network/Cookies"),
+         str(local / "BraveSoftware/Brave-Browser/User Data/Local State")),
+    ]
+
+    # Arc on Windows — Microsoft Store package ID varies, use glob
+    arc_cookie_globs = [
+        str(local / "Packages/TheBrowser.App_*/LocalCache/Roaming/Arc/User Data/Default/Network/Cookies"),
+        str(local / "Arc/User Data/Default/Network/Cookies"),
+    ]
+    arc_state_globs = [
+        str(local / "Packages/TheBrowser.App_*/LocalCache/Roaming/Arc/User Data/Local State"),
+        str(local / "Arc/User Data/Local State"),
+    ]
+    for cg, sg in zip(arc_cookie_globs, arc_state_globs):
+        cm = glob.glob(cg)
+        sm = glob.glob(sg)
+        if cm and sm:
+            candidates.insert(0, ("arc", cm[0], sm[0]))
+            break
+
+    for name, cookie_path, state_path in candidates:
+        cp = Path(cookie_path)
+        sp = Path(state_path)
+        if cp.exists() and sp.exists():
+            results.append((name, cp, sp))
+
+    return results
+
+
+# ── Generic cookie reader ─────────────────────────────────────────────────────
+
+def _read_cookies_from_db(
+    db_path: Path,
+    decrypt_fn,
+) -> dict[str, str]:
+    """Read and decrypt CardMarket cookies from a Chromium SQLite Cookies file."""
     result: dict[str, str] = {}
     try:
+        # Open read-only; copy to temp if locked (Windows locks the file)
         uri = f"file:{db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError:
+            import shutil, tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            shutil.copy2(db_path, tmp.name)
+            conn = sqlite3.connect(tmp.name)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT name, encrypted_value FROM cookies "
@@ -256,92 +348,95 @@ def _read_arc_cookies_from_db() -> dict[str, str]:
             name = row["name"]
             if name not in _CM_COOKIE_NAMES:
                 continue
-            value = _arc_decrypt_value(bytes(row["encrypted_value"]), key)
+            value = decrypt_fn(bytes(row["encrypted_value"]))
             if value:
                 result[name] = value
     except Exception as exc:
-        logger.debug("Arc cookie DB read error: %s", exc)
+        logger.debug("Cookie DB read error (%s): %s", db_path, exc)
     return result
 
 
-def _arc_refresh_cookies(wait: float = 5.0) -> dict[str, str]:
-    """
-    Open cardmarket.com silently in Arc (no focus steal), wait for CF to set
-    fresh cookies, read them, then close the tab — all without interrupting
-    whatever the user is doing.
-    """
-    if not _arc_cookie_db():
-        return {}
+# ── Public auto-import ────────────────────────────────────────────────────────
 
-    logger.debug("Refreshing CardMarket cookies via Arc (background tab)…")
+def auto_import_browser_cookies() -> dict[str, str]:
+    """
+    Extract CardMarket cookies from any available Chromium browser.
 
-    # Open the page without bringing Arc to the foreground
-    try:
-        subprocess.run(
-            ["osascript", "-e", _OPEN_BG_SCRIPT],
-            check=True,
-            timeout=8,
-            capture_output=True,
-        )
-    except Exception as exc:
-        logger.debug("Arc AppleScript open failed: %s", exc)
-        # Fallback: plain open -g so we at least don't steal focus
-        try:
-            subprocess.run(
-                ["open", "-g", "-a", "Arc",
-                 "https://www.cardmarket.com/en/OnePiece"],
-                check=True, timeout=5,
+    macOS: tries Arc → Chrome → Brave → Edge (AES-CBC via Keychain)
+    Windows: tries Arc → Chrome → Brave → Edge (AES-GCM via DPAPI Local State)
+
+    Returns {cookie_name: value}. Empty dict if nothing found.
+    """
+    if _PLATFORM == "Darwin":
+        for name, db_path, keychain_svc in _macos_browsers():
+            cache_key = name
+            key = _macos_master_key(keychain_svc, cache_key)
+            if not key:
+                continue
+            cookies = _read_cookies_from_db(
+                db_path,
+                lambda enc, k=key: _macos_decrypt_value(enc, k),
             )
-        except Exception:
-            return {}
+            if cookies:
+                logger.debug("Got %d CM cookies from %s (macOS)", len(cookies), name)
+                return cookies
 
-    # Wait for page load + CF cookie issuance
-    time.sleep(wait)
+    elif _PLATFORM == "Windows":
+        for name, db_path, state_path in _windows_browsers():
+            cache_key = name
+            key = _windows_browser_key(state_path, cache_key)
+            if not key:
+                continue
+            cookies = _read_cookies_from_db(
+                db_path,
+                lambda enc, k=key: _windows_decrypt_value(enc, k),
+            )
+            if cookies:
+                logger.debug("Got %d CM cookies from %s (Windows)", len(cookies), name)
+                return cookies
 
-    cookies = _read_arc_cookies_from_db()
+    logger.debug("No browser cookies found on %s", _PLATFORM)
+    return {}
 
-    # Close the CardMarket tab silently
-    try:
-        subprocess.run(
-            ["osascript", "-e", _CLOSE_CM_SCRIPT],
-            timeout=8,
-            capture_output=True,
-        )
-        logger.debug("CardMarket tab closed in Arc")
-    except Exception as exc:
-        logger.debug("Could not close Arc tab: %s", exc)
 
+# Backward-compat alias (used internally and in _make_session)
+def auto_import_arc_cookies(refresh_if_stale: bool = False) -> dict[str, str]:
+    cookies = auto_import_browser_cookies()
+    if not cookies and refresh_if_stale and _PLATFORM == "Darwin":
+        cookies = _arc_refresh_cookies()
     return cookies
 
 
-def auto_import_arc_cookies(refresh_if_stale: bool = False) -> dict[str, str]:
-    """
-    Extract CardMarket cookies from Arc browser on macOS.
+def _arc_cookie_db() -> Optional[Path]:
+    """Return Arc's Cookies path if it exists (macOS only). Used for refresh check."""
+    p = Path.home() / "Library/Application Support/Arc/User Data/Default/Cookies"
+    return p if p.exists() else None
 
-    If refresh_if_stale=True and a cf_clearance cookie exists but __cf_bm is
-    missing or stale, trigger a background Arc page-load to refresh cookies.
 
-    Returns a dict of {cookie_name: cookie_value}.
-    Returns an empty dict if Arc is not installed or decryption fails.
-    """
-    result = _read_arc_cookies_from_db()
-
-    if not result:
-        logger.debug("Arc Cookies DB not found or unreadable — skipping auto-import")
+def _arc_refresh_cookies(wait: float = 5.0) -> dict[str, str]:
+    """Open cardmarket.com in Arc silently, wait for fresh CF cookies, close tab."""
+    if not _arc_cookie_db():
         return {}
-
-    if result:
-        logger.debug(
-            "Auto-imported %d CardMarket cookies from Arc: %s",
-            len(result),
-            list(result.keys()),
-        )
-
-    if refresh_if_stale and "cf_clearance" not in result:
-        logger.debug("cf_clearance missing — refreshing via Arc")
-        result = _arc_refresh_cookies()
-
-    return result
+    logger.debug("Refreshing CardMarket cookies via Arc…")
+    try:
+        subprocess.run(["osascript", "-e", _OPEN_BG_SCRIPT],
+                       check=True, timeout=8, capture_output=True)
+    except Exception as exc:
+        logger.debug("Arc AppleScript open failed: %s", exc)
+        try:
+            subprocess.run(["open", "-g", "-a", "Arc",
+                            "https://www.cardmarket.com/en/OnePiece"],
+                           check=True, timeout=5)
+        except Exception:
+            return {}
+    time.sleep(wait)
+    cookies = auto_import_browser_cookies()
+    try:
+        subprocess.run(["osascript", "-e", _CLOSE_CM_SCRIPT],
+                       timeout=8, capture_output=True)
+    except Exception:
+        pass
+    return cookies
 
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
@@ -529,12 +624,23 @@ def _parse_prices(html: str, language_filtered: bool = False) -> dict:
             # real article data — store as a separate key so callers can choose.
             prices["article_min"] = article_min
 
-    # Image — og:image meta tag; skip the generic CM fallback logo
+    # Image — prefer og:image; fall back to first product img on page
+    img_src = None
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
         src = og["content"]
         if "logos/cardmarket" not in src and "cardmarket-logo" not in src:
-            prices["img"] = src
+            img_src = src
+    if not img_src:
+        # Booster boxes / sealed: og:image returns generic logo; real image is
+        # in <img class="is-front"> inside <div class="image">
+        prod_img = soup.select_one("div.image img.is-front")
+        if prod_img:
+            src = prod_img.get("src") or prod_img.get("data-echo") or ""
+            if src and "logos/cardmarket" not in src:
+                img_src = src
+    if img_src:
+        prices["img"] = img_src
 
     return prices
 
@@ -581,9 +687,20 @@ def get_card_prices(
     }
     session = _make_session()
 
-    _is_lang_filtered = language is not None and item_type in (
-        "booster_box", "blister", "sealed_set"
-    )
+    _is_lang_filtered = language is not None
+
+    # Normalise cached URL: strip condition filters, ensure correct language param.
+    # minCondition=1 returns Mint-only listings → inflated "low".
+    # language= param makes info-box trend/from/market language-specific.
+    if known_url:
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        from optcg.scrapers.slugs import LANGUAGE_CM_CODES as _LANG_CODES
+        _p  = urlparse(known_url)
+        _qs = {k: v for k, v in parse_qs(_p.query).items()
+               if k.lower() not in ("mincondition", "maxcondition", "language")}
+        if language and language.upper() in _LANG_CODES:
+            _qs["language"] = [str(_LANG_CODES[language.upper()])]
+        known_url = urlunparse(_p._replace(query=urlencode(_qs, doseq=True)))
 
     # ── Known URL (cached from previous successful fetch) ─────────────────────
     if known_url:

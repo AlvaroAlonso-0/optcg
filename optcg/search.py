@@ -202,13 +202,16 @@ def fetch_card_image_bytes(result: "CardResult") -> Optional[bytes]:
 
 def _write_to_tty(payload: str) -> None:
     """Write raw bytes directly to the terminal, bypassing any stdout capture."""
-    try:
-        with open("/dev/tty", "w") as tty:
-            tty.write(payload)
-            tty.flush()
-    except Exception:
-        sys.stdout.write(payload)
-        sys.stdout.flush()
+    if os.name != "nt":
+        try:
+            with open("/dev/tty", "w") as tty:
+                tty.write(payload)
+                tty.flush()
+            return
+        except Exception:
+            pass
+    sys.stdout.write(payload)
+    sys.stdout.flush()
 
 
 def _iterm2_inline(data: bytes, width_cols: int = 24) -> str:

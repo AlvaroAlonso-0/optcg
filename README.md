@@ -1,16 +1,17 @@
 # optcg — One Piece TCG Investment Tracker
 
 CLI portfolio tracker for One Piece TCG cards, boxes, blisters, and promos.
-Prices scraped live from **CardMarket** and **eBay**. Data syncs to **iCloud Drive**
-so your portfolio is always on your phone.
+Prices scraped live from **CardMarket** and **eBay**.
+
+Works on **macOS** and **Windows**. macOS also syncs data to **iCloud Drive**.
 
 ---
 
 ## Requirements
 
-- macOS (iCloud sync + Arc cookie extraction)
-- Python 3.11+ (Homebrew recommended)
-- [Arc browser](https://arc.net) (for automatic CardMarket login — optional but strongly recommended)
+- Python 3.10+
+- macOS or Windows
+- Chrome, Arc, Brave, or Edge (for automatic CardMarket login — optional but strongly recommended)
 
 ---
 
@@ -19,8 +20,10 @@ so your portfolio is always on your phone.
 ```bash
 git clone https://github.com/YOUR_USERNAME/optcg.git
 cd optcg
-pip install -e . --break-system-packages
+pip install -e .
 ```
+
+On macOS with Homebrew Python, add `--break-system-packages` if pip complains.
 
 Verify:
 
@@ -77,16 +80,16 @@ optcg receipt add 3 ~/Downloads/factura.pdf
 
 ## CardMarket setup
 
-CardMarket uses Cloudflare protection. The easiest setup is **Arc browser**:
+CardMarket uses Cloudflare protection. `optcg` reads cookies automatically from
+**Chrome, Arc, Brave, or Edge** on both macOS and Windows.
 
-1. Install [Arc](https://arc.net) and open `cardmarket.com` once — it loads normally.
-2. That's it. `optcg` reads cookies from Arc automatically. No manual steps.
+1. Open [cardmarket.com](https://www.cardmarket.com/en/OnePiece) in Chrome (or Arc/Brave/Edge) and let it load fully.
+2. That's it — `optcg` extracts the cookies automatically.
 
-**No Arc? Manual fallback:**
+**Manual fallback (any browser):**
 
-1. Open cardmarket.com in Chrome.
-2. DevTools → Application → Cookies → `cf_clearance` → copy value.
-3. `optcg config set-cookie <paste-value>`
+1. Open cardmarket.com → DevTools → Application → Cookies → copy `cf_clearance`.
+2. `optcg config set-cookie <paste-value>`
 
 Run `optcg config cookie-help` for detailed instructions.
 
@@ -95,19 +98,18 @@ Run `optcg config cookie-help` for detailed instructions.
 ## Dashboard (offline HTML file)
 
 Generates a single self-contained `dashboard.html` with all your data baked in.
-No server. Open it by double-clicking on Mac or tapping in Files app on iPhone.
+No server. Open it by double-clicking — it works in any browser.
 
 ```bash
 optcg dashboard            # generate + open immediately
-optcg dashboard --no-open  # just write the file to iCloud
+optcg dashboard --no-open  # just write the file
 ```
 
-The file is saved to **iCloud Drive → OnePieceTCG → exports/dashboard.html**
-and regenerated automatically every time you run `optcg price update --all`.
+The file is saved to the exports folder (see Data storage above) and regenerated
+automatically every time you run `optcg price update --all`.
 
-On iPhone:
-1. Open **Files** → iCloud Drive → OnePieceTCG → exports.
-2. Tap `dashboard.html` — opens in Safari.
+**macOS only:** The file lands in iCloud Drive and syncs to iPhone. Open it in
+Files → iCloud Drive → OnePieceTCG → exports → `dashboard.html`.
 
 Features:
 - **Overview** — invested / current value / P&L stat cards
@@ -119,7 +121,10 @@ Features:
 
 ---
 
-## Phone features (iPhone / iPad)
+## Phone features (macOS / iPhone / iPad only)
+
+> This section is macOS-specific. Windows users can open the exports folder
+> in `Documents/OnePieceTCG` directly.
 
 Your portfolio lives in **iCloud Drive → OnePieceTCG** and syncs automatically.
 
@@ -128,24 +133,20 @@ Your portfolio lives in **iCloud Drive → OnePieceTCG** and syncs automatically
 1. On iPhone, open the **Files** app.
 2. Navigate to **iCloud Drive → OnePieceTCG → exports**.
 3. Tap `portfolio.csv` — it opens in **Numbers** automatically.
-4. You'll see all your items with current prices and P&L.
-5. `price_history.csv` shows the full price timeline for every item.
+4. `price_history.csv` shows the full price timeline for every item.
 
 > The CSV is regenerated every time you run `optcg price update --all` on your Mac.
-> Pull down to refresh in Files after an update.
 
 ### View receipts (tax documents)
 
 1. Files app → **iCloud Drive → OnePieceTCG → receipts**.
 2. Each item has its own folder: `item_3/`, `item_7/`, etc.
-3. Files are named `item_3_2026-01-15.pdf` — date = purchase date.
-4. Tap any file to preview in Quick Look.
+3. Tap any file to preview in Quick Look.
 
 ### Open the database directly (advanced)
 
 The raw database is at `iCloud Drive → OnePieceTCG → tracker.db`.
-Open it with any SQLite viewer app (e.g. **SQLiteViewer** on the App Store)
-for custom queries and filters.
+Open it with any SQLite viewer app (e.g. **SQLiteViewer** on the App Store).
 
 ---
 
@@ -177,14 +178,17 @@ Run `optcg <command> -h` on any command for full options and examples.
 
 ## Data storage
 
-| What | Where |
-|------|-------|
-| Database | `~/Library/Mobile Documents/com~apple~CloudDocs/OnePieceTCG/tracker.db` |
-| Receipts | `…/OnePieceTCG/receipts/` |
-| CSV exports | `…/OnePieceTCG/exports/` |
-| Config / cookies | `~/.config/optcg/config.json` (local, not iCloud) |
+| What | macOS | Windows |
+|------|-------|---------|
+| Database | `~/Library/Mobile Documents/com~apple~CloudDocs/OnePieceTCG/tracker.db` | `~/Documents/OnePieceTCG/tracker.db` |
+| Receipts | `…/OnePieceTCG/receipts/` | `…/OnePieceTCG/receipts/` |
+| CSV exports | `…/OnePieceTCG/exports/` | `…/OnePieceTCG/exports/` |
+| Config / cookies | `~/.config/optcg/config.json` | `~/.config/optcg/config.json` |
 
-The config file stores only a cached Arc key and an optional manual CF cookie.
+On macOS, data lives in iCloud Drive and syncs to iPhone automatically.
+On Windows, data lives in `Documents/OnePieceTCG`.
+
+The config file stores only a cached browser key and an optional manual CF cookie.
 It never leaves your machine and is excluded from git.
 
 ---
