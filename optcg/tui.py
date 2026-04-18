@@ -111,12 +111,13 @@ def _write_native_image(fd: int, data: bytes, width_cols: int) -> None:
 
 
 def _price_key(item: dict) -> tuple:
-    """Dedup key: same card/product = same name + set + number + language + type."""
+    """Dedup key: same card/product = same name + set + number + language + condition + type."""
     return (
         item.get("name") or "",
         item.get("set_code") or "",
         item.get("card_number") or "",
         item.get("language") or "",
+        item.get("condition") or "",
         item.get("item_type") or "",
     )
 
@@ -1270,6 +1271,7 @@ class OptcgTUI(App):
                     selected["name"], selected["set_code"], selected["card_number"],
                     selected["language"], selected["item_type"],
                     known_url=selected.get("cardmarket_url"),
+                    condition=selected.get("condition"),
                 )
                 with db_conn() as conn:
                     db = Database(conn)
