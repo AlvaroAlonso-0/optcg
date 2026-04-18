@@ -14,9 +14,9 @@ def get_latest_snapshot(item_id: int, db: Database) -> Optional[dict]:
         "    ELSE                    2 "   # ebay_sold / anything else
         "  END ASC, "
         "  CASE price_type "
-        "    WHEN 'low'    THEN 0 "
-        "    WHEN 'trend'  THEN 1 "
-        "    WHEN 'market' THEN 2 "
+        "    WHEN 'trend'  THEN 0 "   # 30-day average — most stable market indicator
+        "    WHEN 'market' THEN 1 "   # recent transaction avg
+        "    WHEN 'low'    THEN 2 "   # cheapest listing (can be different condition)
         "    ELSE               3 "
         "  END ASC, "
         "  fetched_at DESC, id DESC LIMIT 1",
