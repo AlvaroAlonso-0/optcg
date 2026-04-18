@@ -25,10 +25,22 @@ pip install -e .
 
 On macOS with Homebrew Python, add `--break-system-packages` if pip complains.
 
+**Windows — if `optcg` is not recognized:**
+
+Python's Scripts folder is often not on PATH. Either add it (search "Edit environment variables" → PATH → add `%APPDATA%\Python\Python3XX\Scripts`), or use:
+
+```powershell
+python -m optcg
+```
+
+This works identically to the `optcg` command.
+
 Verify:
 
 ```bash
 optcg --version
+# or on Windows if not on PATH:
+python -m optcg --version
 ```
 
 ---
