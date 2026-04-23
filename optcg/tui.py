@@ -224,6 +224,7 @@ class DetailPane(Static):
             self.update("[dim]↑↓ select item[/dim]")
             return
         status = item.get("status", "owned")
+        has_receipt = bool(item.get("has_receipt"))
         lines  = [f"[bold]#{item['id']} {item['name']}[/bold]", ""]
         meta = []
         if item.get("set_code"):    meta.append(item["set_code"])
@@ -239,6 +240,9 @@ class DetailPane(Static):
         ]
         if item.get("purchase_source"):
             lines.append(f"[dim]Source:[/dim] {item['purchase_source']}")
+        lines.append(
+            f"[dim]Receipt:[/dim] {'[green]yes[/green]' if has_receipt else '[dim]no[/dim]'}"
+        )
         if status == "sold":
             sp = item.get("sell_price"); sd = item.get("sell_date") or ""
             lines += ["", f"[green bold]✔ Sold[/green bold]  {_fmt(sp)}€  [dim]{sd}[/dim]"]
@@ -848,7 +852,12 @@ class OptcgTUI(App):
         conn = get_connection()
         db   = Database(conn)
         items = db.fetchall("SELECT * FROM items")
-        self._all_rows = [{"item": dict(i), "pnl": item_pnl(i, db)} for i in items]
+        receipt_ids = {r["item_id"] for r in db.fetchall("SELECT DISTINCT item_id FROM receipts")}
+        self._all_rows = []
+        for i in items:
+            item = dict(i)
+            item["has_receipt"] = item["id"] in receipt_ids
+            self._all_rows.append({"item": item, "pnl": item_pnl(i, db)})
         self._summary  = portfolio_summary(db)
         conn.close()
         self.query_one("#summary", SummaryBar).update_stats(self._summary)
@@ -876,7 +885,12 @@ class OptcgTUI(App):
             if self.sort_key == "pnl":   return -(p["pnl"] or 0) if p else 0
             if self.sort_key == "pct":   return -(p["pnl_pct"] or 0) if p else 0
             if self.sort_key == "price": return -(r["item"]["purchase_price"] or 0)
-            if self.sort_key == "date":  return -(r["item"]["purchase_date"] or "")
+            if self.sort_key == "date":
+                d = (r["item"]["purchase_date"] or "").replace("-", "")
+                try:
+                    return -int(d)
+                except ValueError:
+                    return 0
             if self.sort_key == "name":  return r["item"]["name"].lower()
             return 0
         return sorted(rows, key=_sk)
@@ -896,6 +910,7 @@ class OptcgTUI(App):
         tbl.add_column("Name",  width=26)
         tbl.add_column("Type",  width=7)
         tbl.add_column("Set",   width=9)
+        tbl.add_column("Rcp",   width=5)
         tbl.add_column("Paid €",  width=9)
         tbl.add_column("Now €",   width=9)
         tbl.add_column("P&L €",   width=9)
@@ -910,6 +925,7 @@ class OptcgTUI(App):
             itype = {"booster_box":"Box   ","sealed_set":"Sealed",
                      "blister":"Blister","card":"Single","promo":"Promo "
                      }.get(i["item_type"], i["item_type"])
+            rcp_s = "[blue]📄[/blue]" if i.get("has_receipt") else "—"
             paid_s = f"{i['purchase_price']:.2f}"
             cur_s  = _fmt(p["current"], 2) if p and p["current"] is not None else "—"
             pnl_s = pct_s = ""
@@ -919,7 +935,7 @@ class OptcgTUI(App):
                 pct_s = f"[{c}]{s}{p['pnl_pct']:.1f}%[/{c}]"
             tbl.add_row(str(i["id"]), name, itype,
                         i["set_code"] or "—",
-                        paid_s, cur_s, pnl_s, pct_s)
+                        rcp_s, paid_s, cur_s, pnl_s, pct_s)
         if self._visible and self._cursor < len(self._visible):
             tbl.move_cursor(row=self._cursor)
 
