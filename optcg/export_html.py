@@ -164,7 +164,7 @@ def _svg_hbars(labels, values, colors=None, fmt_val=None, max_rows=30) -> str:
     bars    = ""
     for i, (lbl, v) in enumerate(zip(labels, values)):
         y     = i * ROW + 5
-        color = (colors[i] if colors else None) or (_GREEN if v >= 0 else _RED)
+        color = (colors[i % len(colors)] if colors else None) or (_GREEN if v >= 0 else _RED)
         blen  = abs(v) / mx * BW
         ox    = LW + (BW / 2 if has_neg else 0)
         bx    = ox if v >= 0 else ox - blen

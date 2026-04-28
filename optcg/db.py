@@ -103,12 +103,15 @@ def _ensure_dirs() -> None:
 
 def get_connection() -> sqlite3.Connection:
     _ensure_dirs()
-    conn = sqlite3.connect(str(DB_PATH))
+    # timeout=30: wait up to 30s if iCloud briefly locks the file during sync
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     # DELETE journal is required for iCloud sync — WAL sidecar files don't
     # sync atomically alongside the main .db file.
     conn.execute("PRAGMA journal_mode = DELETE")
+    # Belt-and-suspenders: SQLite-level busy timeout matches the connect timeout
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 

@@ -30,6 +30,7 @@ import io
 import os
 import sys
 import threading
+import time
 from typing import Optional
 
 from rich.text import Text
@@ -154,6 +155,21 @@ def _half_block_render(data: bytes, W: int, H: int) -> Text:
 
 
 # ── Widgets ───────────────────────────────────────────────────────────────────
+
+class CFWarning(Static):
+    """Shown when CardMarket is Cloudflare-blocked."""
+    DEFAULT_CSS = "CFWarning { display: none; background: ansi_yellow; color: ansi_black; padding: 0 1; height: 1; }"
+
+    def show(self) -> None:
+        self.display = True
+        self.update(
+            "[bold]⚠ Cloudflare blocked[/bold]  CardMarket is rate-limiting requests. "
+            "Open cardmarket.com in Arc/Chrome and browse for ~30s, then retry."
+        )
+
+    def hide(self) -> None:
+        self.display = False
+
 
 class SummaryBar(Static):
     def update_stats(self, summary: dict) -> None:
@@ -818,6 +834,7 @@ class OptcgTUI(App):
 
     def compose(self) -> ComposeResult:
         yield SummaryBar(id="summary")
+        yield CFWarning(id="cf-warning")
         with Horizontal(id="filter-row"):
             yield Label("", id="filter-label")
             yield Input(placeholder="  / to search…", id="search-input")
@@ -843,6 +860,7 @@ class OptcgTUI(App):
         self._refresh_right()
         self._update_filter_bar()
         self.query_one("#portfolio").focus()
+        self._update_cf_warning()
 
     # ── Data ──────────────────────────────────────────────────────────────────
 
@@ -1264,6 +1282,15 @@ class OptcgTUI(App):
         self.notify(f"Refreshed — {n} item{'s' if n != 1 else ''}", timeout=2)
 
 
+    def _update_cf_warning(self) -> None:
+        """Background probe — show/hide CF warning bar based on current CM status."""
+        def _probe():
+            from optcg.scrapers.cardmarket import is_cf_blocked
+            blocked = is_cf_blocked()
+            w = self.app.query_one("#cf-warning", CFWarning)
+            self.app.call_from_thread(w.show if blocked else w.hide)
+        threading.Thread(target=_probe, daemon=True).start()
+
     def action_update_price(self) -> None:
         """Update price for selected item — and all duplicates that share the same card."""
         if self._view_mode == "wishlist":
@@ -1302,7 +1329,12 @@ class OptcgTUI(App):
                         if cm.get("url"):
                             db.execute("UPDATE items SET cardmarket_url=? WHERE id=?",
                                        (cm["url"], item_id))
+                        if cm.get("img"):
+                            db.execute("UPDATE items SET cardmarket_img=? WHERE id=?",
+                                       (cm["img"], item_id))
                 app.call_from_thread(self._after_price, ids, cm)
+                if cm.get("error"):
+                    self._update_cf_warning()
             except Exception as exc:
                 app.call_from_thread(self.notify, f"Failed: {exc}", severity="error")
         threading.Thread(target=_do, daemon=True).start()
@@ -1380,12 +1412,15 @@ class OptcgTUI(App):
         )
         app = self.app
         def _do_all():
+            import random
             from optcg.scrapers.cardmarket import get_card_prices
             from optcg.db import db_conn, Database
             done = 0
             for k, items in groups.items():
                 rep  = items[0]   # representative item for the fetch
                 ids  = [i["id"] for i in items]
+                if done > 0:
+                    time.sleep(random.uniform(2.0, 3.5))
                 try:
                     cm = get_card_prices(
                         rep["name"], rep["set_code"], rep["card_number"],
@@ -1406,6 +1441,9 @@ class OptcgTUI(App):
                             if cm.get("url"):
                                 db.execute("UPDATE items SET cardmarket_url=? WHERE id=?",
                                            (cm["url"], item_id))
+                            if cm.get("img"):
+                                db.execute("UPDATE items SET cardmarket_img=? WHERE id=?",
+                                           (cm["img"], item_id))
                     done += 1
                     copies = f" ×{len(ids)}" if len(ids) > 1 else ""
                     app.call_from_thread(
@@ -1428,6 +1466,7 @@ class OptcgTUI(App):
         )
         self._load_data()
         self._build_table(); self._refresh_right(); self._update_filter_bar()
+        self._update_cf_warning()
 
     def _after_price(self, ids: list[int], cm: dict) -> None:
         cm_p = cm.get("low") or cm.get("trend")

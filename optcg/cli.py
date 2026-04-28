@@ -741,28 +741,36 @@ def _add_from_result(r, lang: str) -> None:
         return
 
     # ── Portfolio path ────────────────────────────────────────────────────────
-    price     = click.prompt("Purchase price (EUR)", type=float)
+    price     = click.prompt("Purchase price per item (EUR)", type=float)
+    qty       = click.prompt("Quantity", type=int, default=1)
     pick_lang = click.prompt("Language", default=lang or "EN").upper()
     condition = click.prompt("Condition [M/NM/LP/MP/HP/PL]", default="NM").upper()
     source    = click.prompt("Source", default="CardMarket")
 
-    item_id = _insert_item(
-        item_type=item_type, name=r.name, set_code=set_code,
-        card_number=r.card_number, language=pick_lang, condition=condition,
-        foil=False, variant=r.variant or None, graded=False,
-        grading_company=None, grade=None, cert_number=None,
-        price=price, purchase_date=str(date.today()), source=source, notes=None,
-    )
+    item_ids = []
+    for _ in range(max(1, qty)):
+        iid = _insert_item(
+            item_type=item_type, name=r.name, set_code=set_code,
+            card_number=r.card_number, language=pick_lang, condition=condition,
+            foil=False, variant=r.variant or None, graded=False,
+            grading_company=None, grade=None, cert_number=None,
+            price=price, purchase_date=str(date.today()), source=source, notes=None,
+        )
+        item_ids.append(iid)
 
-    # Cache CM URL
+    # Cache CM URL and search thumbnail image on all copies
     from optcg.config import DB_PATH
     import sqlite3 as _sqlite3
     _c = _sqlite3.connect(str(DB_PATH))
-    _c.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?", (cm_url, item_id))
+    for iid in item_ids:
+        _c.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?", (cm_url, iid))
+        if r.image_url:
+            _c.execute("UPDATE items SET cardmarket_img = ? WHERE id = ?", (r.image_url, iid))
     _c.commit(); _c.close()
 
-    console.print(f"[green]✓[/green] Added {item_type} [bold]#{item_id}[/bold]: {r.name}")
-    _auto_update(item_id)
+    qty_str = f" ×{qty}" if qty > 1 else ""
+    console.print(f"[green]✓[/green] Added {item_type}{qty_str} [bold]#{item_ids[0]}{'–#'+str(item_ids[-1]) if qty > 1 else ''}[/bold]: {r.name}")
+    _auto_update_multi(item_ids)
 
 
 def _print_search_table(results, page: int, sort: str) -> None:
@@ -806,8 +814,13 @@ def search_cmd(query: str, lang: str, sort: str, page: int, image: bool, pick: i
       optcg search "Zoro" --image          # browse, view images, add interactively
     """
     # ── Initial fetch ─────────────────────────────────────────────────────────
-    with console.status(f"[dim]Searching [bold]{query}[/bold]  [page {page}, sort: {sort}]…"):
-        results = search_cardmarket(query, language=lang, sort=sort, page=page)
+    from optcg.search import CFBlockedError
+    try:
+        with console.status(f"[dim]Searching [bold]{query}[/bold]  [page {page}, sort: {sort}]…"):
+            results = search_cardmarket(query, language=lang, sort=sort, page=page)
+    except CFBlockedError as e:
+        console.print(f"[bold red]⚠ {e}[/bold red]")
+        return
 
     if not results:
         console.print("[yellow]No results.[/yellow]")
@@ -1291,9 +1304,14 @@ def price_update(item_id, all_items):
                    item["condition"] or "", item["item_type"])
             groups[key].append(item)
 
+        import random as _random
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                       console=console) as prog:
+            _group_idx = 0
             for group_items in groups.values():
+                if _group_idx > 0:
+                    _time.sleep(_random.uniform(2.0, 3.5))
+                _group_idx += 1
                 representative = group_items[0]
                 ids = [i["id"] for i in group_items]
                 qty = len(ids)

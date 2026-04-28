@@ -75,6 +75,14 @@ _KEY_TTL_DAYS    = 7
 # Per-browser in-process key cache  {cache_key: bytes}
 _key_cache: dict[str, bytes] = {}
 
+# Arc refresh throttle — only open browser once per process lifetime
+_arc_refresh_done: bool = False
+
+# CF status cache — avoid hammering CM just to check status
+_cf_blocked_cache: Optional[bool] = None
+_cf_blocked_at: float = 0.0
+_CF_CACHE_TTL = 120.0  # seconds
+
 # AppleScript: open CardMarket in Arc without stealing focus (macOS only)
 _OPEN_BG_SCRIPT = """\
 tell application "Arc"
@@ -415,8 +423,13 @@ def _arc_cookie_db() -> Optional[Path]:
 
 def _arc_refresh_cookies(wait: float = 5.0) -> dict[str, str]:
     """Open cardmarket.com in Arc silently, wait for fresh CF cookies, close tab."""
+    global _arc_refresh_done
+    if _arc_refresh_done:
+        logger.debug("Arc cookie refresh already attempted this session — skipping")
+        return {}
     if not _arc_cookie_db():
         return {}
+    _arc_refresh_done = True
     logger.debug("Refreshing CardMarket cookies via Arc…")
     try:
         subprocess.run(["osascript", "-e", _OPEN_BG_SCRIPT],
@@ -439,21 +452,62 @@ def _arc_refresh_cookies(wait: float = 5.0) -> dict[str, str]:
     return cookies
 
 
+# ── CF status probe ───────────────────────────────────────────────────────────
+
+def is_cf_blocked() -> bool:
+    """Return True if CardMarket search is currently Cloudflare-blocked.
+
+    Uses a lightweight probe against the search endpoint (which CF challenges
+    more aggressively than the homepage). Result cached for 2 minutes so
+    repeated calls don't hammer CM.
+    """
+    global _cf_blocked_cache, _cf_blocked_at
+    now = time.monotonic()
+    if _cf_blocked_cache is not None and (now - _cf_blocked_at) < _CF_CACHE_TTL:
+        return _cf_blocked_cache
+
+    try:
+        sess = _make_session()
+        resp = sess.get(
+            "https://www.cardmarket.com/en/OnePiece/Products/Search"
+            "?searchString=test&idGame=17&view=list&site=1",
+            headers=_HEADERS,
+            timeout=10,
+        )
+        blocked = _is_cf_block(resp.status_code, resp.text)
+    except Exception:
+        blocked = True  # network error → treat as blocked
+
+    _cf_blocked_cache = blocked
+    _cf_blocked_at    = now
+    return blocked
+
+
+def clear_cf_cache() -> None:
+    """Invalidate the CF status cache (call after a successful fetch)."""
+    global _cf_blocked_cache
+    _cf_blocked_cache = None
+
+
 # ── HTTP session ──────────────────────────────────────────────────────────────
 
 def _make_session(warmup: bool = False) -> object:
     if _HAS_CFFI:
-        sess = cffi_requests.Session(impersonate="chrome133a")
+        sess = cffi_requests.Session(impersonate="chrome136")
     else:
         import requests
         sess = requests.Session()
         logger.warning("curl_cffi not installed; install it for better results")
 
     # Primary: auto-import from Arc browser
+    # __cf_bm and _cfuvid are bound to the TLS session that created them —
+    # sending them from a different client causes CF to reject the request.
+    _SESSION_BOUND = {"__cf_bm", "_cfuvid"}
     arc_cookies = auto_import_arc_cookies()
     if arc_cookies:
         for name, value in arc_cookies.items():
-            sess.cookies.set(name, value, domain="www.cardmarket.com")
+            if name not in _SESSION_BOUND:
+                sess.cookies.set(name, value, domain="www.cardmarket.com")
     else:
         # Fallback: manually stored cf_clearance
         cf = get_cf_cookie()
@@ -526,6 +580,7 @@ def _fetch(url: str, session=None, _retry: bool = True) -> Optional[str]:
             return None
         resp.raise_for_status()
         time.sleep(0.5)
+        clear_cf_cache()  # successful fetch → CF no longer blocking
         return resp.text
     except Exception as exc:
         logger.error("CardMarket fetch error: %s", exc)

@@ -17,6 +17,17 @@ from optcg.scrapers.cardmarket import _make_session, _HEADERS, _is_cf_block
 from optcg.scrapers.slugs import LANGUAGE_CM_CODES, CM_BASE
 
 
+# ── Exceptions ───────────────────────────────────────────────────────────────
+
+class CFBlockedError(Exception):
+    """Raised when CardMarket returns a Cloudflare challenge instead of results."""
+    def __str__(self):
+        return (
+            "CardMarket is Cloudflare-blocked. "
+            "Open cardmarket.com in Arc/Chrome, browse for ~30s, then retry."
+        )
+
+
 # ── Data types ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -85,7 +96,7 @@ def search_cardmarket(
     sess = _make_session()
     resp = sess.get(url, headers=_HEADERS, timeout=20)
     if _is_cf_block(resp.status_code, resp.text):
-        return []
+        raise CFBlockedError()
 
     soup = BeautifulSoup(resp.text, "lxml")
     results: list[CardResult] = []
@@ -294,11 +305,15 @@ def pick_card(
     page = 1
 
     while True:
-        with console.status(
-            f"[dim]Searching [bold]{query}[/bold]  "
-            f"[page {page}, sort: {sort}]…"
-        ):
-            results = search_cardmarket(query, language, sort=sort, page=page)
+        try:
+            with console.status(
+                f"[dim]Searching [bold]{query}[/bold]  "
+                f"[page {page}, sort: {sort}]…"
+            ):
+                results = search_cardmarket(query, language, sort=sort, page=page)
+        except CFBlockedError as e:
+            console.print(f"[bold red]⚠ {e}[/bold red]")
+            return None
 
         if not results:
             if page > 1:
