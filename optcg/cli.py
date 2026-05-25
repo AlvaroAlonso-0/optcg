@@ -92,6 +92,39 @@ def _insert_item(
         )
 
 
+def _insert_items(
+    qty: int,
+    item_type: str, name: str, set_code: Optional[str], card_number: Optional[str],
+    language: str, condition: Optional[str], foil: bool, variant: Optional[str],
+    graded: bool, grading_company: Optional[str], grade: Optional[str],
+    cert_number: Optional[str], price: float, purchase_date: str,
+    source: Optional[str], notes: Optional[str],
+    status: str = "owned",
+    cardmarket_url: Optional[str] = None,
+    cardmarket_img: Optional[str] = None,
+) -> list[int]:
+    item_ids: list[int] = []
+    with db_conn() as conn:
+        db = Database(conn)
+        for _ in range(max(1, qty)):
+            iid = db.lastrowid(
+                """INSERT INTO items
+                   (item_type, name, set_code, card_number, language, condition,
+                    foil, variant, graded, grading_company, grade, cert_number,
+                    purchase_price, purchase_date, purchase_source, notes, status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (item_type, name, set_code, card_number, language, condition,
+                 int(foil), variant, int(graded), grading_company, grade, cert_number,
+                 price, purchase_date, source, notes, status),
+            )
+            item_ids.append(iid)
+            if cardmarket_url:
+                db.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?", (cardmarket_url, iid))
+            if cardmarket_img:
+                db.execute("UPDATE items SET cardmarket_img = ? WHERE id = ?", (cardmarket_img, iid))
+    return item_ids
+
+
 def _auto_update(item_id: int) -> None:
     """Fetch price for a single item and regenerate the dashboard. Called after add/edit."""
     from optcg.scrapers.cardmarket import get_card_prices
@@ -747,26 +780,15 @@ def _add_from_result(r, lang: str) -> None:
     condition = click.prompt("Condition [M/NM/LP/MP/HP/PL]", default="NM").upper()
     source    = click.prompt("Source", default="CardMarket")
 
-    item_ids = []
-    for _ in range(max(1, qty)):
-        iid = _insert_item(
-            item_type=item_type, name=r.name, set_code=set_code,
-            card_number=r.card_number, language=pick_lang, condition=condition,
-            foil=False, variant=r.variant or None, graded=False,
-            grading_company=None, grade=None, cert_number=None,
-            price=price, purchase_date=str(date.today()), source=source, notes=None,
-        )
-        item_ids.append(iid)
-
-    # Cache CM URL and search thumbnail image on all copies
-    from optcg.config import DB_PATH
-    import sqlite3 as _sqlite3
-    _c = _sqlite3.connect(str(DB_PATH))
-    for iid in item_ids:
-        _c.execute("UPDATE items SET cardmarket_url = ? WHERE id = ?", (cm_url, iid))
-        if r.image_url:
-            _c.execute("UPDATE items SET cardmarket_img = ? WHERE id = ?", (r.image_url, iid))
-    _c.commit(); _c.close()
+    item_ids = _insert_items(
+        qty=max(1, qty),
+        item_type=item_type, name=r.name, set_code=set_code,
+        card_number=r.card_number, language=pick_lang, condition=condition,
+        foil=False, variant=r.variant or None, graded=False,
+        grading_company=None, grade=None, cert_number=None,
+        price=price, purchase_date=str(date.today()), source=source, notes=None,
+        cardmarket_url=cm_url, cardmarket_img=r.image_url,
+    )
 
     qty_str = f" ×{qty}" if qty > 1 else ""
     console.print(f"[green]✓[/green] Added {item_type}{qty_str} [bold]#{item_ids[0]}{'–#'+str(item_ids[-1]) if qty > 1 else ''}[/bold]: {r.name}")

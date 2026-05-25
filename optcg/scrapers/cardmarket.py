@@ -791,6 +791,12 @@ def get_card_prices(
                 return result
 
     # ── Search fallback ───────────────────────────────────────────────────────
+    # Skip when known_url was provided: falling back to a generic search would
+    # overwrite the user's pinned product URL with a random (often cheaper) hit.
+    if known_url:
+        result["error"] = "Cached URL returned no prices — clear it with: optcg price set-url <id> <url>"
+        return result
+
     # For sealed products (booster boxes, blisters) CardMarket lists EN and JP
     # as separate product pages — inject language into the search query so the
     # correct edition is returned.  Sealed products are always mint/sealed, so
