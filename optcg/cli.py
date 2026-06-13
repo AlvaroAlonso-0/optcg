@@ -1322,8 +1322,8 @@ def price_update(item_id, all_items):
         from collections import defaultdict
         groups: dict[tuple, list] = defaultdict(list)
         for item in items:
-            key = (item["name"], item["set_code"] or "", item["language"] or "EN",
-                   item["condition"] or "", item["item_type"])
+            key = (item["name"], item["set_code"] or "", item["card_number"] or "",
+                   item["language"] or "EN", item["condition"] or "", item["item_type"])
             groups[key].append(item)
 
         import random as _random
