@@ -74,10 +74,10 @@ LANGUAGE_CM_CODES: dict[str, int] = {
     "IT":   5,
     "PT":   8,
     "JP":   7,
-    "ZH":   10,   # Chinese Traditional (Taiwan market)
-    "ZH-T": 10,
-    "ZH-S": 11,   # Chinese Simplified
-    "KR":   9,
+    "ZH":   6,    # bare "Chinese" → treat as Simplified (mainland, most common)
+    "ZH-S": 6,    # Chinese Simplified
+    "ZH-T": 11,   # Chinese Traditional (Taiwan market)
+    "KR":   10,
 }
 
 CM_BASE = "https://www.cardmarket.com/en/OnePiece"
